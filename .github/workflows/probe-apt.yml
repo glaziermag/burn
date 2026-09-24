@@ -1,0 +1,27 @@
+name: probe-apt
+on:
+  workflow_dispatch:
+jobs:
+  apt-stock-ubuntu2404:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: apt config check
+        run: |
+          apt-get update -qq
+          echo "--- assume-yes config present on this image?"; grep -rs -i 'assume' /etc/apt/apt.conf.d/ || echo "(none)"
+      - name: A - upstream command (no -y), stdin closed like a runner step
+        id: a
+        continue-on-error: true
+        run: apt-get install valgrind </dev/null
+      - name: A outcome
+        run: echo "outcome without -y = ${{ steps.a.outcome }}"
+      - name: B - with -y
+        run: |
+          apt-get install -y valgrind
+          valgrind --version
+  apt-hosted-config:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: show hosted-runner apt config
+        run: grep -rs -i 'assume' /etc/apt/apt.conf.d/ || echo "(none)"
