@@ -1,0 +1,68 @@
+name: probe-memcheck
+on:
+  workflow_dispatch:
+env:
+  CAREFUL_VERSION: "0.4.9"
+  CAREFUL_LINK: https://github.com/RalfJung/cargo-careful/releases/download
+jobs:
+  careful-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rustfmt, rust-src
+      - name: A - upstream install step (dot asset name, curl -L)
+        run: |
+          set +e
+          curl -sSL -o /dev/null -w 'HTTP %{http_code} for dot-name URL\n' "$CAREFUL_LINK/v$CAREFUL_VERSION/cargo-careful.x86_64-unknown-linux-musl"
+          curl -L "$CAREFUL_LINK/v$CAREFUL_VERSION/cargo-careful.x86_64-unknown-linux-musl" --output $HOME/.cargo/bin/cargo-careful
+          chmod +x $HOME/.cargo/bin/cargo-careful
+          echo "--- file:"; file $HOME/.cargo/bin/cargo-careful
+          echo "--- contents:"; cat $HOME/.cargo/bin/cargo-careful; echo
+          cargo +nightly careful --version; echo "cargo careful exit=$?"
+      - name: B - curl -fL on the dot asset name fails loudly
+        run: |
+          set +e
+          curl -fL "$CAREFUL_LINK/v$CAREFUL_VERSION/cargo-careful.x86_64-unknown-linux-musl" --output /tmp/x; echo "curl -fL exit=$?"
+      - name: C - fixed install step (hyphen asset name, curl -fL)
+        run: |
+          curl -fL "$CAREFUL_LINK/v$CAREFUL_VERSION/cargo-careful-x86_64-unknown-linux-musl" --output $HOME/.cargo/bin/cargo-careful
+          chmod +x $HOME/.cargo/bin/cargo-careful
+          file $HOME/.cargo/bin/cargo-careful
+          cargo +nightly careful --version
+      - name: D - cargo careful runs tests (burn-std lib)
+        run: cargo +nightly careful test -p burn-std --lib
+  careful-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: rustfmt, rust-src
+      - uses: tracel-ai/github-actions/install-mesa@v11
+      - name: Install cargo-careful (fixed)
+        run: |
+          curl -fL "$CAREFUL_LINK/v$CAREFUL_VERSION/cargo-careful-x86_64-unknown-linux-musl" --output $HOME/.cargo/bin/cargo-careful
+          chmod +x $HOME/.cargo/bin/cargo-careful
+      - run: df -h /
+      - name: Run cargo-careful (upstream command)
+        run: cargo +nightly careful test
+      - if: always()
+        run: df -h /
+  apt-valgrind:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: A - upstream command (no -y)
+        id: a
+        continue-on-error: true
+        run: sudo apt-get install valgrind
+      - name: A outcome
+        run: echo "upstream step outcome=${{ steps.a.outcome }}"
+      - name: B - with -y
+        run: |
+          sudo apt-get install -y valgrind
+          valgrind --version
