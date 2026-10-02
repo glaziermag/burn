@@ -1,0 +1,74 @@
+name: probe-narrow
+on:
+  workflow_dispatch:
+env:
+  CAREFUL_VERSION: "0.4.10"
+  CAREFUL_LINK: https://github.com/RalfJung/cargo-careful/releases/download
+  UNIT_PKGS: "-p burn-std -p burn-tensor -p burn-backend -p burn-ndarray -p burn-flex"
+  SUITE_ARGS: "-p burn-backend-tests --no-default-features --features flex,std"
+  VALGRIND_RUNNER: "valgrind -s --leak-check=full --show-leak-kinds=all --error-exitcode=1"
+jobs:
+  careful-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with: { ref: fix/scheduled-memcheck-install }
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { toolchain: nightly, components: "rustfmt, rust-src" }
+      - name: Install cargo-careful
+        run: |
+          curl -fL "$CAREFUL_LINK/v$CAREFUL_VERSION/cargo-careful-x86_64-unknown-linux-musl" --output $HOME/.cargo/bin/cargo-careful
+          chmod +x $HOME/.cargo/bin/cargo-careful
+      - run: df -h / | tail -1
+      - name: careful unit crates
+        run: cargo +nightly careful test $UNIT_PKGS
+      - if: always()
+        run: df -h / | tail -1; du -sh target || true
+  careful-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with: { ref: fix/scheduled-memcheck-install }
+      - uses: dtolnay/rust-toolchain@nightly
+        with: { toolchain: nightly, components: "rustfmt, rust-src" }
+      - name: Install cargo-careful
+        run: |
+          curl -fL "$CAREFUL_LINK/v$CAREFUL_VERSION/cargo-careful-x86_64-unknown-linux-musl" --output $HOME/.cargo/bin/cargo-careful
+          chmod +x $HOME/.cargo/bin/cargo-careful
+      - run: df -h / | tail -1
+      - name: careful backend suite on flex
+        run: cargo +nightly careful test $SUITE_ARGS
+      - if: always()
+        run: df -h / | tail -1; du -sh target || true
+  valgrind-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with: { ref: fix/scheduled-memcheck-install }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y valgrind
+      - run: df -h / | tail -1
+      - name: valgrind unit crates
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ env.VALGRIND_RUNNER }}
+        run: cargo test $UNIT_PKGS
+      - if: always()
+        run: df -h / | tail -1; du -sh target || true
+  valgrind-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v7
+        with: { ref: fix/scheduled-memcheck-install }
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get install -y valgrind
+      - run: df -h / | tail -1
+      - name: valgrind backend suite on flex
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ env.VALGRIND_RUNNER }}
+        run: cargo test $SUITE_ARGS
+      - if: always()
+        run: df -h / | tail -1; du -sh target || true
