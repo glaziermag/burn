@@ -1,0 +1,93 @@
+name: probe-valgrind-120
+on:
+  push:
+    branches: [probe/valgrind-120]
+jobs:
+  arm-a-main-steps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Remove the hosted runner's Rust (the stock GCE ubuntu-2404-lts image has none)
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          for t in cargo rustc rustup; do if command -v "$t"; then echo "$t still on PATH"; exit 1; fi; done
+          echo "no Rust toolchain on PATH"
+      - name: checkout
+        uses: actions/checkout@v7
+      # --------------------------------------------------------------------------------
+      - name: Install Mesa
+        uses: tracel-ai/github-actions/install-mesa@v12
+      # --------------------------------------------------------------------------------
+      - name: Install valgrind
+        run: |
+          sudo apt-get install -y valgrind
+      # --------------------------------------------------------------------------------
+      - name: Run cargo-valgrind
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "valgrind -s --leak-check=full --show-leak-kinds=all --error-exitcode=1"
+        # Looking for vulnerabilities
+        run: |
+          cargo test
+  arm-b-pr-steps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Remove the hosted runner's Rust (the stock GCE ubuntu-2404-lts image has none)
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          for t in cargo rustc rustup; do if command -v "$t"; then echo "$t still on PATH"; exit 1; fi; done
+          echo "no Rust toolchain on PATH"
+      - name: checkout
+        uses: actions/checkout@v7
+      # --------------------------------------------------------------------------------
+      - name: Install Rust
+        uses: tracel-ai/github-actions/install-rust@v12
+        with:
+          rust-toolchain: stable
+          enable-cache: false
+      # --------------------------------------------------------------------------------
+      - name: Install Mesa
+        uses: tracel-ai/github-actions/install-mesa@v12
+      # --------------------------------------------------------------------------------
+      - name: Install valgrind
+        run: |
+          sudo apt-get install -y valgrind
+      # --------------------------------------------------------------------------------
+      - name: Run cargo-valgrind
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "valgrind -s --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite --error-exitcode=1"
+        # Looking for vulnerabilities
+        run: |
+          cargo test --no-fail-fast -p burn-std -p burn-tensor -p burn-backend -p burn-flex
+          cargo test --no-fail-fast -p burn-backend-tests --no-default-features --features flex,std
+  arm-c-pr-steps-old-flags:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Remove the hosted runner's Rust (the stock GCE ubuntu-2404-lts image has none)
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          for t in cargo rustc rustup; do if command -v "$t"; then echo "$t still on PATH"; exit 1; fi; done
+          echo "no Rust toolchain on PATH"
+      - name: checkout
+        uses: actions/checkout@v7
+      # --------------------------------------------------------------------------------
+      - name: Install Rust
+        uses: tracel-ai/github-actions/install-rust@v12
+        with:
+          rust-toolchain: stable
+          enable-cache: false
+      # --------------------------------------------------------------------------------
+      - name: Install Mesa
+        uses: tracel-ai/github-actions/install-mesa@v12
+      # --------------------------------------------------------------------------------
+      - name: Install valgrind
+        run: |
+          sudo apt-get install -y valgrind
+      # --------------------------------------------------------------------------------
+      - name: Run cargo-valgrind
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "valgrind -s --leak-check=full --show-leak-kinds=all --error-exitcode=1"
+        # Looking for vulnerabilities
+        run: |
+          cargo test --no-fail-fast -p burn-std -p burn-tensor -p burn-backend -p burn-flex
