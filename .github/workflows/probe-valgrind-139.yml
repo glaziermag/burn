@@ -1,0 +1,131 @@
+name: probe-valgrind-139
+on:
+  push:
+    branches: [probe/valgrind-139]
+jobs:
+  arm-a1-main-steps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - name: Remove the hosted runner's Rust (the GCE ubuntu-2404-lts image has none)
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          for t in cargo rustc rustup; do if command -v "$t"; then echo "$t still on PATH"; exit 1; fi; done
+          echo "no Rust toolchain on PATH"; nproc; free -m | sed -n 2p
+      - name: Start resource monitor
+        run: |
+          nohup bash -c 'while true; do echo "$(date -u +%H:%M:%S) used_mb=$(free -m | awk "/Mem:/{print \$3}") avail_mb=$(free -m | awk "/Mem:/{print \$7}") disk_used=$(df -BG --output=used / | tail -1 | tr -d " ") vg=$(pgrep -c -f valgrind)"; sleep 30; done' > "$RUNNER_TEMP/res.log" 2>&1 &
+          echo started
+      - name: checkout
+        uses: actions/checkout@v7
+      # --------------------------------------------------------------------------------
+      - name: Install Rust
+        uses: tracel-ai/github-actions/install-rust@v12
+        with:
+          rust-toolchain: stable
+          enable-cache: false
+      # --------------------------------------------------------------------------------
+      - name: Install Mesa
+        uses: tracel-ai/github-actions/install-mesa@v12
+      # --------------------------------------------------------------------------------
+      - name: Install valgrind
+        run: |
+          sudo apt-get install -y valgrind
+      # --------------------------------------------------------------------------------
+      - name: Run cargo-valgrind
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "valgrind -s --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite --error-exitcode=1"
+        # Looking for vulnerabilities
+        run: |
+          cargo test --no-fail-fast -p burn-std -p burn-tensor -p burn-backend -p burn-flex
+          cargo test --no-fail-fast -p burn-backend-tests --no-default-features --features flex,std,flex-simd,flex-rayon
+      - name: Resource summary
+        if: always()
+        run: |
+          awk '{for(i=1;i<=NF;i++){split($i,a,"="); if(a[1]=="used_mb"&&a[2]>m)m=a[2]; if(a[1]=="avail_mb"&&(n==""||a[2]<n))n=a[2]}} END{print "peak_used_mb=" m, "min_avail_mb=" n, "samples=" NR}' "$RUNNER_TEMP/res.log"
+          tail -2 "$RUNNER_TEMP/res.log"
+  arm-a2-main-steps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - name: Remove the hosted runner's Rust (the GCE ubuntu-2404-lts image has none)
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          for t in cargo rustc rustup; do if command -v "$t"; then echo "$t still on PATH"; exit 1; fi; done
+          echo "no Rust toolchain on PATH"; nproc; free -m | sed -n 2p
+      - name: Start resource monitor
+        run: |
+          nohup bash -c 'while true; do echo "$(date -u +%H:%M:%S) used_mb=$(free -m | awk "/Mem:/{print \$3}") avail_mb=$(free -m | awk "/Mem:/{print \$7}") disk_used=$(df -BG --output=used / | tail -1 | tr -d " ") vg=$(pgrep -c -f valgrind)"; sleep 30; done' > "$RUNNER_TEMP/res.log" 2>&1 &
+          echo started
+      - name: checkout
+        uses: actions/checkout@v7
+      # --------------------------------------------------------------------------------
+      - name: Install Rust
+        uses: tracel-ai/github-actions/install-rust@v12
+        with:
+          rust-toolchain: stable
+          enable-cache: false
+      # --------------------------------------------------------------------------------
+      - name: Install Mesa
+        uses: tracel-ai/github-actions/install-mesa@v12
+      # --------------------------------------------------------------------------------
+      - name: Install valgrind
+        run: |
+          sudo apt-get install -y valgrind
+      # --------------------------------------------------------------------------------
+      - name: Run cargo-valgrind
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "valgrind -s --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite --error-exitcode=1"
+        # Looking for vulnerabilities
+        run: |
+          cargo test --no-fail-fast -p burn-std -p burn-tensor -p burn-backend -p burn-flex
+          cargo test --no-fail-fast -p burn-backend-tests --no-default-features --features flex,std,flex-simd,flex-rayon
+      - name: Resource summary
+        if: always()
+        run: |
+          awk '{for(i=1;i<=NF;i++){split($i,a,"="); if(a[1]=="used_mb"&&a[2]>m)m=a[2]; if(a[1]=="avail_mb"&&(n==""||a[2]<n))n=a[2]}} END{print "peak_used_mb=" m, "min_avail_mb=" n, "samples=" NR}' "$RUNNER_TEMP/res.log"
+          tail -2 "$RUNNER_TEMP/res.log"
+  arm-b-main-steps-16-threads:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      RUST_TEST_THREADS: 16
+      RAYON_NUM_THREADS: 16
+    steps:
+      - name: Remove the hosted runner's Rust (the GCE ubuntu-2404-lts image has none)
+        run: |
+          rm -rf "$HOME/.cargo" "$HOME/.rustup"
+          for t in cargo rustc rustup; do if command -v "$t"; then echo "$t still on PATH"; exit 1; fi; done
+          echo "no Rust toolchain on PATH"; nproc; free -m | sed -n 2p
+      - name: Start resource monitor
+        run: |
+          nohup bash -c 'while true; do echo "$(date -u +%H:%M:%S) used_mb=$(free -m | awk "/Mem:/{print \$3}") avail_mb=$(free -m | awk "/Mem:/{print \$7}") disk_used=$(df -BG --output=used / | tail -1 | tr -d " ") vg=$(pgrep -c -f valgrind)"; sleep 30; done' > "$RUNNER_TEMP/res.log" 2>&1 &
+          echo started
+      - name: checkout
+        uses: actions/checkout@v7
+      # --------------------------------------------------------------------------------
+      - name: Install Rust
+        uses: tracel-ai/github-actions/install-rust@v12
+        with:
+          rust-toolchain: stable
+          enable-cache: false
+      # --------------------------------------------------------------------------------
+      - name: Install Mesa
+        uses: tracel-ai/github-actions/install-mesa@v12
+      # --------------------------------------------------------------------------------
+      - name: Install valgrind
+        run: |
+          sudo apt-get install -y valgrind
+      # --------------------------------------------------------------------------------
+      - name: Run cargo-valgrind
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: "valgrind -s --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite --error-exitcode=1"
+        # Looking for vulnerabilities
+        run: |
+          cargo test --no-fail-fast -p burn-std -p burn-tensor -p burn-backend -p burn-flex
+          cargo test --no-fail-fast -p burn-backend-tests --no-default-features --features flex,std,flex-simd,flex-rayon
+      - name: Resource summary
+        if: always()
+        run: |
+          awk '{for(i=1;i<=NF;i++){split($i,a,"="); if(a[1]=="used_mb"&&a[2]>m)m=a[2]; if(a[1]=="avail_mb"&&(n==""||a[2]<n))n=a[2]}} END{print "peak_used_mb=" m, "min_avail_mb=" n, "samples=" NR}' "$RUNNER_TEMP/res.log"
+          tail -2 "$RUNNER_TEMP/res.log"
