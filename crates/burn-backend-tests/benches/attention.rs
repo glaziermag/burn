@@ -11,7 +11,7 @@ use common::BencherExt;
 
 use burn_tensor::module::attention;
 use burn_tensor::ops::AttentionModuleOptions;
-use burn_tensor::{Tensor, TensorData};
+use burn_tensor::{FloatDType, Tensor, TensorData};
 use divan::Bencher;
 
 #[cfg(not(feature = "bench-disable-alloc"))]
@@ -75,6 +75,7 @@ macro_rules! bench_attention {
                         v.clone(),
                         None,
                         None,
+                        None,
                         Default::default(),
                     )
                 });
@@ -94,6 +95,7 @@ macro_rules! bench_attention {
                             v.clone(),
                             None,
                             None,
+                            None,
                             Default::default(),
                         )
                     });
@@ -107,6 +109,7 @@ macro_rules! bench_attention {
                             q.clone(),
                             k.clone(),
                             v.clone(),
+                            None,
                             None,
                             None,
                             Default::default(),
@@ -124,6 +127,7 @@ macro_rules! bench_attention {
                             v.clone(),
                             None,
                             None,
+                            None,
                             Default::default(),
                         )
                     });
@@ -137,6 +141,7 @@ macro_rules! bench_attention {
                             q.clone(),
                             k.clone(),
                             v.clone(),
+                            None,
                             None,
                             None,
                             Default::default(),
@@ -154,6 +159,7 @@ macro_rules! bench_attention {
                             v.clone(),
                             None,
                             None,
+                            None,
                             Default::default(),
                         )
                     });
@@ -167,6 +173,7 @@ macro_rules! bench_attention {
                             q.clone(),
                             k.clone(),
                             v.clone(),
+                            None,
                             None,
                             None,
                             Default::default(),
@@ -190,7 +197,15 @@ macro_rules! bench_attention {
                 fn b1_h12_s128_d64(bencher: Bencher) {
                     let (q, k, v) = make_qkv(1, 12, 128, 128, 64);
                     bencher.bench_synced(|| {
-                        attention(q.clone(), k.clone(), v.clone(), None, None, causal_opts())
+                        attention(
+                            q.clone(),
+                            k.clone(),
+                            v.clone(),
+                            None,
+                            None,
+                            None,
+                            causal_opts(),
+                        )
                     });
                 }
 
@@ -198,7 +213,15 @@ macro_rules! bench_attention {
                 fn b1_h12_s256_d64(bencher: Bencher) {
                     let (q, k, v) = make_qkv(1, 12, 256, 256, 64);
                     bencher.bench_synced(|| {
-                        attention(q.clone(), k.clone(), v.clone(), None, None, causal_opts())
+                        attention(
+                            q.clone(),
+                            k.clone(),
+                            v.clone(),
+                            None,
+                            None,
+                            None,
+                            causal_opts(),
+                        )
                     });
                 }
 
@@ -206,7 +229,15 @@ macro_rules! bench_attention {
                 fn b1_h12_s512_d64(bencher: Bencher) {
                     let (q, k, v) = make_qkv(1, 12, 512, 512, 64);
                     bencher.bench_synced(|| {
-                        attention(q.clone(), k.clone(), v.clone(), None, None, causal_opts())
+                        attention(
+                            q.clone(),
+                            k.clone(),
+                            v.clone(),
+                            None,
+                            None,
+                            None,
+                            causal_opts(),
+                        )
                     });
                 }
             }
@@ -226,6 +257,7 @@ macro_rules! bench_attention {
                             v.clone(),
                             None,
                             Some(bias.clone()),
+                            None,
                             Default::default(),
                         )
                     });
@@ -242,6 +274,7 @@ macro_rules! bench_attention {
                             v.clone(),
                             None,
                             Some(bias.clone()),
+                            None,
                             Default::default(),
                         )
                     });
@@ -262,6 +295,7 @@ macro_rules! bench_attention {
                             v.clone(),
                             None,
                             None,
+                            None,
                             Default::default(),
                         )
                     });
@@ -277,7 +311,92 @@ macro_rules! bench_attention {
                             v.clone(),
                             None,
                             None,
+                            None,
                             Default::default(),
+                        )
+                    });
+                }
+            }
+
+            // Qwen3-8B's heads (32 query heads of 128 features sharing 8 key heads): a prompt of
+            // 512 tokens and decode steps of 8 users against 4096 cached positions, in f16, and a
+            // training step's causal prompts in f32.
+            #[divan::bench_group(name = "transformer")]
+            mod transformer {
+                use super::*;
+
+                fn causal_opts() -> AttentionModuleOptions {
+                    AttentionModuleOptions {
+                        is_causal: true,
+                        ..Default::default()
+                    }
+                }
+
+                /// The query of 32 heads and the keys and values of 8, `[batch, heads, seq, 128]`.
+                fn grouped(
+                    batch: usize,
+                    seq_q: usize,
+                    seq_k: usize,
+                ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
+                    let (q, _, _) = make_qkv(batch, 32, seq_q, seq_k, 128);
+                    let (_, k, v) = make_qkv(batch, 8, seq_q, seq_k, 128);
+                    (q, k, v)
+                }
+
+                fn half(
+                    (q, k, v): (Tensor<4>, Tensor<4>, Tensor<4>),
+                ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
+                    (
+                        q.cast(FloatDType::F16),
+                        k.cast(FloatDType::F16),
+                        v.cast(FloatDType::F16),
+                    )
+                }
+
+                #[divan::bench]
+                fn prefill_b1_h32_kv8_s512_d128(bencher: Bencher) {
+                    let (q, k, v) = half(grouped(1, 512, 512));
+                    bencher.bench_synced(|| {
+                        attention(
+                            q.clone(),
+                            k.clone(),
+                            v.clone(),
+                            None,
+                            None,
+                            None,
+                            causal_opts(),
+                        )
+                    });
+                }
+
+                #[divan::bench]
+                fn decode_b8_h32_kv8_s4096_d128(bencher: Bencher) {
+                    let (q, k, v) = half(grouped(8, 1, 4096));
+                    bencher.bench_synced(|| {
+                        attention(
+                            q.clone(),
+                            k.clone(),
+                            v.clone(),
+                            None,
+                            None,
+                            None,
+                            Default::default(),
+                        )
+                    });
+                }
+
+                #[divan::bench]
+                fn training_f32_b4_h32_kv8_s512_d128(bencher: Bencher) {
+                    let (q, k, v) = grouped(4, 512, 512);
+                    bencher.bench_synced(|| {
+                        attention(
+                            q.clone(),
+                            k.clone(),
+                            v.clone(),
+                            None,
+                            None,
+                            None,
+                            causal_opts(),
                         )
                     });
                 }

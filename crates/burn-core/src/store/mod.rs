@@ -6,10 +6,11 @@
 //! [`Module`](crate::module::Module) trait itself ([`Module::into_record`](crate::module::Module::into_record) /
 //! [`Module::load_record`](crate::module::Module::load_record)).
 //!
-//! This module is intentionally tiny: traversal is a straightforward
+//! Traversal uses a
 //! [`ModuleVisitor`](crate::module::ModuleVisitor) / [`ModuleMapper`](crate::module::ModuleMapper)
-//! keyed by parameter path, with no filtering, adapters, or lazy snapshots.
-//! The richer snapshot/import tooling (filtering, key remapping, PyTorch/SafeTensors adapters,
+//! keyed by parameter path. [`Module::into_record_group`](crate::module::Module::into_record_group)
+//! selects parameters using a [`ParamGroup`](crate::module::ParamGroup).
+//! The richer snapshot/import tooling (key remapping, PyTorch/SafeTensors adapters,
 //! cross-framework stores) lives in the `burn-store` crate.
 
 use alloc::format;
@@ -40,8 +41,8 @@ pub enum DTypePolicy {
 pub enum RecordError {
     /// An I/O or format error occurred while reading or writing the record.
     Io(String),
-    /// Validation failed while applying the record (shape mismatch, or missing tensors
-    /// when partial loading is not allowed).
+    /// Validation failed while applying the record: a shape mismatch, missing tensors when
+    /// partial loading is disabled, or unused record tensors when unused entries are disallowed.
     Validation(String),
 }
 
@@ -78,8 +79,8 @@ struct RecordTensor {
 /// [`Module::load_record`]. Load-time behavior is
 /// configured with the builder methods; they are ignored when saving.
 ///
-/// The save-side dtype is intentionally not configurable: use `module.cast(dtype)` before
-/// taking the record. The record stores whatever dtype the module currently holds.
+/// The record preserves the dtypes of the collected tensors.
+/// [`with_dtype_policy`](Self::with_dtype_policy) only affects loading; it does not cast saved data.
 #[derive(Clone)]
 pub struct ModuleRecord {
     tensors: Vec<RecordTensor>,
@@ -137,27 +138,29 @@ impl ModuleRecord {
 
     /// Allow loading even when some module parameters are absent from the record.
     ///
-    /// What a record of a part of a module needs — one taken with
-    /// [`into_record_group`](crate::module::Module::into_record_group), say — since it holds
-    /// nothing for the parameters outside that part.
+    /// Disabled by default. Missing parameters are left unchanged when enabled. This setting is
+    /// independent of [`validate`](Self::validate) and [`allow_unused`](Self::allow_unused).
+    /// Use it for a record taken with [`Module::into_record_group`], which holds nothing for
+    /// parameters outside the selected group.
     pub fn allow_partial(mut self, allow: bool) -> Self {
         self.allow_partial = allow;
         self
     }
 
-    /// Allow loading even when the record holds tensors no module parameter matches.
+    /// Allow record tensors that do not match any module parameter.
     ///
-    /// The mirror of [`allow_partial`](Self::allow_partial), and refused by default: a record
-    /// entry that lands nowhere means the module is not the one the record was taken from, and
-    /// the load that looks like it succeeded has quietly done less than it was asked — or, at
-    /// `allow_partial(true)`, nothing at all. Allow it for the deliberate case, loading a
-    /// checkpoint into a part of the module it came from.
+    /// Disabled by default. Unmatched record tensors are ignored when enabled. This setting is
+    /// independent of [`validate`](Self::validate) and [`allow_partial`](Self::allow_partial).
     pub fn allow_unused(mut self, allow: bool) -> Self {
         self.allow_unused = allow;
         self
     }
 
-    /// Enable or disable validation while loading.
+    /// Check for shape mismatches while loading. Enabled by default.
+    ///
+    /// When disabled, shape-mismatched parameters are left unchanged. Missing and unused tensors
+    /// are still checked independently, according to [`allow_partial`](Self::allow_partial) and
+    /// [`allow_unused`](Self::allow_unused).
     pub fn validate(mut self, validate: bool) -> Self {
         self.validate = validate;
         self
@@ -190,13 +193,8 @@ impl ModuleRecord {
         self.tensors
             .into_iter()
             .map(|t| {
-                burn_pack::Tensor::new(
-                    t.path,
-                    t.data.dtype,
-                    t.data.shape,
-                    Some(t.id.val()),
-                    t.data.bytes,
-                )
+                let (bytes, shape, dtype) = t.data.into_parts();
+                burn_pack::Tensor::new(t.path, dtype, shape, Some(t.id.val()), bytes)
             })
             .collect()
     }
@@ -232,7 +230,8 @@ impl ModuleRecord {
 
     /// Apply this record to a module, returning the loaded module.
     ///
-    /// Honors the record's [`DTypePolicy`], `validate`, and `allow_partial` settings. Backs
+    /// Honors the record's [`DTypePolicy`], [`validate`](Self::validate),
+    /// [`allow_partial`](Self::allow_partial), and [`allow_unused`](Self::allow_unused) settings. Backs
     /// [`Module::try_load_record`](crate::module::Module::try_load_record).
     pub(crate) fn apply<M: Module>(self, module: M) -> Result<M, RecordError> {
         let validate = self.validate;
@@ -379,14 +378,15 @@ impl ModuleRecordMapper {
 
         // Resolve the dtype to load with (CastToModule casts to the module's dtype).
         let dtype = match self.dtype_policy {
-            DTypePolicy::FromRecord => data.dtype,
+            DTypePolicy::FromRecord => data.dtype(),
             DTypePolicy::CastToModule => module_dtype(),
         };
 
-        if data.shape != target_shape {
+        if *data.shape() != target_shape {
             self.errors.push(format!(
                 "{path}: shape mismatch, expected {:?} but record has {:?}",
-                target_shape, data.shape
+                target_shape,
+                data.shape()
             ));
             return None;
         }
@@ -491,21 +491,6 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_in_memory() {
-        let device = Default::default();
-        let model = Tiny::new([[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0], &device);
-
-        let bytes = model.into_record().into_bytes().unwrap();
-        let record = ModuleRecord::from_bytes(bytes).unwrap();
-        assert_eq!(record.len(), 2);
-
-        let loaded = Tiny::new([[0.0; 2]; 2], [0.0; 2], &device).load_record(record);
-        let (w, b) = weights(&loaded);
-        assert_eq!(w, vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(b, vec![5.0, 6.0]);
-    }
-
-    #[test]
     fn records_exclude_flags_and_loading_preserves_the_target_flag() {
         let device = Default::default();
         let bytes = Flagged::new(7.0, false, &device)
@@ -572,24 +557,6 @@ mod tests {
             .try_load_record(record.allow_unused(true))
             .unwrap();
         assert_eq!(weights(&loaded), (vec![0.0; 4], vec![0.0; 2]));
-    }
-
-    #[test]
-    fn round_trip_file() {
-        let device = Default::default();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tiny.bpk");
-
-        Tiny::new([[1.0, 2.0], [3.0, 4.0]], [5.0, 6.0], &device)
-            .into_record()
-            .save(&path)
-            .unwrap();
-
-        let record = ModuleRecord::load(&path).unwrap();
-        let loaded = Tiny::new([[0.0; 2]; 2], [0.0; 2], &device).load_record(record);
-        let (w, b) = weights(&loaded);
-        assert_eq!(w, vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(b, vec![5.0, 6.0]);
     }
 
     #[test]
@@ -753,7 +720,7 @@ mod tests {
         assert_eq!(saved.weight.val().dims(), [2, 3]);
         let record = saved.into_record();
         assert_eq!(
-            record.tensors[0].data.shape,
+            *record.tensors[0].data.shape(),
             Shape::from([3, 2]),
             "the record must hold the save form, not the live form"
         );

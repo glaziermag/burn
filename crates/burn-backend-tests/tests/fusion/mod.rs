@@ -1,19 +1,28 @@
 pub use super::*;
 
 mod cat;
+#[cfg(feature = "cube")]
+mod dequantize;
 mod fusion_f16_broadcast;
 mod fusion_f16_write_vectorization;
 mod fusion_shape;
+#[cfg(feature = "cube")]
+mod gather;
 // Asserts on launch-level decisions from `burn-cubecl-fusion`, which only the `cube`
 // feature pulls in; the rest of this suite also runs on non-cube fusion backends (flex).
 #[cfg(feature = "cube")]
 mod inplace;
 mod int_bitwise;
+mod matmul;
+// Asserts the matmul and its epilogue fuse, which only the cube fusion backend does.
+#[cfg(feature = "cube")]
+mod matmul_epilogue_view;
 mod nhwc_relayout;
 #[cfg(feature = "cube")]
 mod padded_layout;
 mod reduce_broadcasted;
 mod reduce_logical;
+mod select;
 
 use burn_tensor::StreamId;
 

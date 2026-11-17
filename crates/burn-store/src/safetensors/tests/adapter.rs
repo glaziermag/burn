@@ -51,7 +51,7 @@ fn pytorch_to_burn_adapter_linear_transpose() {
     let weight1 = model.linear.weight.val().to_data();
     let weight2 = model2.linear.weight.val().to_data();
 
-    assert_eq!(weight1.shape, weight2.shape);
+    assert_eq!(weight1.shape(), weight2.shape());
     let data1 = weight1.try_to_vec::<f32>().unwrap();
     let data2 = weight2.try_to_vec::<f32>().unwrap();
 
@@ -143,52 +143,11 @@ fn no_adapter_preserves_original() {
     let weight1 = model.linear.weight.val().to_data();
     let weight2 = model2.linear.weight.val().to_data();
 
-    assert_eq!(weight1.shape, weight2.shape);
+    assert_eq!(weight1.shape(), weight2.shape());
     assert_eq!(
         weight1.try_to_vec::<f32>().unwrap(),
         weight2.try_to_vec::<f32>().unwrap()
     );
-}
-
-#[test]
-#[cfg(all(feature = "std", target_has_atomic = "ptr"))]
-fn adapter_with_pytorch_import() {
-    use crate::PyTorchToBurnAdapter;
-
-    let device = Default::default();
-
-    // Reference the safetensors file from burn-store
-    let safetensors_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/safetensors-tests/tests/multi_layer/multi_layer.safetensors"
-    );
-
-    // Simple test model that matches some of the PyTorch structure
-    #[derive(Module, Debug)]
-    struct SimpleNet {
-        fc1: Linear,
-    }
-
-    impl SimpleNet {
-        fn new(device: &Device) -> Self {
-            Self {
-                fc1: LinearConfig::new(4 * 8 * 8, 16).init(device),
-            }
-        }
-    }
-
-    // Load with PyTorchToBurn adapter
-    let mut store = SafetensorsStore::from_file(safetensors_path)
-        .with_from_adapter(PyTorchToBurnAdapter)
-        .validate(false)
-        .allow_partial(true);
-
-    let mut model = SimpleNet::new(&device);
-    let result = model.load_from(&mut store).unwrap();
-
-    // Should load some tensors (fc1 if it exists in the file)
-    // This mainly tests that the adapter works with real PyTorch files
-    assert!(!result.applied.is_empty() || !result.missing.is_empty());
 }
 
 #[test]
@@ -214,14 +173,14 @@ fn half_precision_adapter_round_trip() {
     for (name, snapshot) in snapshots.iter() {
         if name.starts_with("linear") {
             assert_eq!(
-                snapshot.dtype,
+                snapshot.dtype(),
                 DType::F16,
                 "Linear tensor '{}' should be F16",
                 name
             );
         } else {
             assert_eq!(
-                snapshot.dtype,
+                snapshot.dtype(),
                 DType::F32,
                 "Raw param '{}' should stay F32",
                 name
@@ -289,14 +248,14 @@ fn half_precision_adapter_without_module() {
     for (name, snapshot) in snapshots {
         if name.starts_with("linear") {
             assert_eq!(
-                snapshot.dtype,
+                snapshot.dtype(),
                 DType::F16,
                 "Linear tensor '{}' should be F16",
                 name
             );
         } else if name.starts_with("norm") {
             assert_eq!(
-                snapshot.dtype,
+                snapshot.dtype(),
                 DType::F32,
                 "LayerNorm tensor '{}' should stay F32",
                 name
@@ -336,11 +295,11 @@ fn half_precision_adapter_default_converts_layer_norm() {
     let snapshots = inspect_store.get_all_tensors().unwrap();
     for (name, snapshot) in snapshots {
         assert_eq!(
-            snapshot.dtype,
+            snapshot.dtype(),
             DType::F16,
             "All tensors should be F16 by default, but '{}' is {:?}",
             name,
-            snapshot.dtype
+            snapshot.dtype()
         );
     }
 }

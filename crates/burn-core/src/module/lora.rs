@@ -39,7 +39,7 @@ use crate::module::{LoraAdapter, Param, ParamGroup, Quantizer, Reparameterizer};
 /// ```
 #[derive(Debug, Clone)]
 pub struct Lora {
-    /// Rank of the low-rank decomposition.
+    /// Rank of the low-rank decomposition. Must be greater than zero.
     pub rank: usize,
     /// Scaling numerator; the adapter contribution is scaled by `alpha / rank`.
     pub alpha: f64,
@@ -56,7 +56,12 @@ pub struct Lora {
 
 impl Lora {
     /// Create a new LoRA reparameterizer with the given rank and alpha.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rank` is zero.
     pub fn new(rank: usize, alpha: f64) -> Self {
+        Self::assert_valid_rank(rank);
         Self {
             rank,
             alpha,
@@ -64,6 +69,10 @@ impl Lora {
             dtype: None,
             param_group: ParamGroup::all(),
         }
+    }
+
+    fn assert_valid_rank(rank: usize) {
+        assert!(rank > 0, "LoRA rank must be greater than 0, got {rank}");
     }
 
     /// Set the parameter group on which to apply LoRA adapters.
@@ -87,6 +96,8 @@ impl Reparameterizer for Lora {
         path: &str,
         param: Param<Tensor<D>>,
     ) -> (Param<Tensor<D>>, Option<Self::Reparam>) {
+        Self::assert_valid_rank(self.rank);
+
         // LoRA only adapts 2-D weight matrices. Every other base parameter is frozen too, so that
         // only the adapter factors are trained (the canonical LoRA fine-tuning contract).
         if D != 2 {
@@ -153,6 +164,20 @@ impl Reparameterizer for Lora {
 /// The quantized base is kept at rest in its low-bit representation; the adapter contribution is
 /// added on top during the forward pass (the base is dequantized on the fly when composed).
 /// Module-owned control flags are left unchanged, as with [`Lora`].
+///
+/// # Memory limitations
+///
+/// QLoRA reduces stored base-weight memory and trains only the adapter factors, but still
+/// composes a dense effective weight as `dequantize(base) + scale * (a @ b)`. For a linear
+/// projection whose input requires gradients, autodiff retains that dense weight for backward
+/// and computes a full weight-shaped gradient before propagating into the factors. Peak training
+/// memory can therefore be substantially higher than the packed weights and adapters alone suggest.
+/// Fusion can avoid a separate dequantized base allocation, but does not eliminate all of these
+/// dense intermediates.
+///
+/// [`Module::valid`](crate::module::Module::valid) preserves the packed base and adapters.
+/// Explicitly calling [`Module::materialize`](crate::module::Module::materialize) merges them
+/// into dense weights; requantization must be requested separately.
 pub struct QLora {
     lora: Lora,
     quantizer: Quantizer,
@@ -401,7 +426,7 @@ mod tests {
         // the initial delta is zero, so it is just the dequantized base.
         let composed = weight.val();
         assert_eq!(composed.dims(), [8, 8]);
-        assert_eq!(composed.into_data().shape, original.into_data().shape);
+        assert_eq!(composed.into_data().shape(), original.into_data().shape());
     }
 
     #[cfg(feature = "autodiff")]
@@ -501,17 +526,73 @@ mod tests {
 
     #[cfg(feature = "autodiff")]
     #[test]
-    fn lora_valid_folds_adapter_for_inference() {
+    fn lora_valid_preserves_adapter_and_train_restores_only_factors() {
         let device = test_device().autodiff();
         let lora = Lora::new(2, 4.0);
         let model = SimpleLinear::new(4, 6, &device).apply_lora(lora);
 
         let inference = model.valid();
-        // The inference parameter has no adapter (folded) and equals the composed training weight.
-        assert!(inference.weight.adapter().is_none());
+        let adapter = inference.weight.adapter().unwrap();
+        assert!(!inference.weight.base().is_autodiff());
+        assert!(!adapter.a.val().is_autodiff());
+        assert!(!adapter.b.val().is_autodiff());
+        assert_eq!(adapter.a.id, model.weight.adapter().unwrap().a.id);
+        assert_eq!(adapter.b.id, model.weight.adapter().unwrap().b.id);
         inference.weight.val().into_data().assert_approx_eq::<f32>(
             &model.weight.val().inner().into_data(),
             Tolerance::default(),
         );
+
+        let restored = inference.valid().train();
+        assert!(!restored.weight.base().is_require_grad());
+        assert!(!restored.bias.as_ref().unwrap().is_require_grad());
+        let adapter = restored.weight.adapter().unwrap();
+        let grads = restored.weight.val().sum().backward();
+        assert!(restored.weight.base().grad(&grads).is_none());
+        assert!(adapter.a.val().grad(&grads).is_some());
+        assert!(adapter.b.val().grad(&grads).is_some());
+
+        let merged = model.valid().materialize();
+        assert!(merged.weight.adapter().is_none());
+        assert!(!merged.weight.val().is_autodiff());
+        merged.weight.val().into_data().assert_approx_eq::<f32>(
+            &model.weight.val().inner().into_data(),
+            Tolerance::default(),
+        );
+        assert!(!merged.train().weight.base().is_require_grad());
+    }
+
+    #[test]
+    #[should_panic(expected = "LoRA rank must be greater than 0")]
+    fn lora_new_rejects_rank_zero() {
+        let _ = Lora::new(0, 4.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "LoRA rank must be greater than 0")]
+    fn lora_rejects_rank_zero_set_after_construction() {
+        let device = test_device();
+        let mut lora = Lora::new(2, 4.0);
+        lora.rank = 0;
+        let _ = SimpleLinear::new(4, 6, &device).apply_lora(lora);
+    }
+
+    #[test]
+    #[should_panic(expected = "LoRA rank must be greater than 0")]
+    fn qlora_rejects_rank_zero_set_after_construction() {
+        use crate::module::Quantizer;
+        use burn_tensor::quantization::{Calibration, QuantValue};
+
+        let device = test_device();
+        let scheme = device
+            .settings()
+            .quantization
+            .scheme
+            .with_value(QuantValue::Q8S);
+        let quantizer = Quantizer::new(Calibration::MinMax, scheme);
+
+        let mut lora = Lora::new(2, 4.0);
+        lora.rank = 0;
+        let _ = SimpleLinear::new(8, 8, &device).apply_qlora(QLora::new(lora, quantizer));
     }
 }

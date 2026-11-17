@@ -10,7 +10,8 @@ use core::iter::Sum;
 use core::ops::AddAssign;
 
 use macerator::{
-    ReduceAdd, ReduceMax, ReduceMin, Simd, VAdd, VOrd, vload_unaligned, vstore_unaligned,
+    ReduceAdd, ReduceMax, ReduceMin, Simd, VAdd, VMaskReduce, VOrd, vload_unaligned,
+    vstore_unaligned,
 };
 use num_traits::Float;
 
@@ -18,16 +19,23 @@ use num_traits::Float;
 // Sum reduction
 // ============================================================================
 
-/// Sum all elements in a f32 slice using SIMD with 4 accumulators.
+/// Sum all elements in a f32 slice using SIMD.
 #[inline]
 pub fn sum_f32(data: &[f32]) -> f32 {
     macerator_sum(data)
 }
 
+#[macerator::with_simd]
+fn macerator_sum<S: Simd, F: VAdd + Sum + ReduceAdd>(xs: &[F]) -> F {
+    sum_body::<S, F>(xs)
+}
+
 /// 8-accumulator SIMD sum. Independent accumulator chains let the CPU
 /// pipeline floating-point adds and hide L2 cache latency.
-#[macerator::with_simd]
-fn macerator_sum<S: Simd, F: VAdd + Sum + ReduceAdd>(mut xs: &[F]) -> F {
+///
+/// Not dispatched itself so it inlines into the loop of a dispatched caller.
+#[inline(always)]
+fn sum_body<S: Simd, F: VAdd + Sum + ReduceAdd>(mut xs: &[F]) -> F {
     let lanes = F::lanes::<S>();
     let stride = lanes * 8;
     let zero = F::default().splat::<S>();
@@ -163,10 +171,21 @@ pub fn sum_rows_f32(src: &[f32], dst: &mut [f32], num_rows: usize, row_len: usiz
         num_rows * row_len,
         src.len()
     );
-    for (row, dst_val) in dst.iter_mut().enumerate() {
-        let row_start = row * row_len;
-        let row_data = &src[row_start..row_start + row_len];
-        *dst_val = macerator_sum(row_data);
+    sum_rows_at_f32(src, (0..num_rows).map(|row| row * row_len), row_len, dst);
+}
+
+/// Sum the `row_len` elements starting at each offset in `starts`, writing one
+/// result per row into `dst`. `starts` must yield `dst.len()` offsets. SIMD
+/// dispatch happens once for all rows.
+#[macerator::with_simd]
+pub fn sum_rows_at_f32<S: Simd, I: Iterator<Item = usize>>(
+    src: &[f32],
+    starts: I,
+    row_len: usize,
+    dst: &mut [f32],
+) {
+    for (start, dst_val) in starts.zip(dst.iter_mut()) {
+        *dst_val = sum_body::<S, f32>(&src[start..start + row_len]);
     }
 }
 
@@ -187,7 +206,7 @@ pub fn min_f32(data: &[f32]) -> f32 {
 }
 
 #[macerator::with_simd]
-fn macerator_max<S: Simd, F: VOrd + ReduceMax + Float>(mut xs: &[F], init: F) -> F {
+fn macerator_max<S: Simd, F: VOrd + VMaskReduce + ReduceMax + Float>(mut xs: &[F], init: F) -> F {
     let lanes = F::lanes::<S>();
     let initial = init.splat::<S>();
     let mut acc = initial;
@@ -205,7 +224,7 @@ fn macerator_max<S: Simd, F: VOrd + ReduceMax + Float>(mut xs: &[F], init: F) ->
     }
 
     let mut result = acc.reduce_max();
-    let mut has_nan = false;
+    let mut has_nan = nan_mask.any();
     for &x in xs {
         has_nan |= x.is_nan();
         if x > result {
@@ -213,21 +232,11 @@ fn macerator_max<S: Simd, F: VOrd + ReduceMax + Float>(mut xs: &[F], init: F) ->
         }
     }
 
-    let mut nan_lanes = [false; 64];
-    assert!(
-        lanes <= nan_lanes.len(),
-        "SIMD f32 lane count {lanes} exceeds the supported maximum"
-    );
-    // SAFETY: `nan_lanes` is valid for 64 contiguous booleans, and the
-    // assertion above proves that the SIMD mask writes at most that many.
-    unsafe { nan_mask.store_as_bool(nan_lanes.as_mut_ptr()) };
-    has_nan |= nan_lanes[..lanes].iter().any(|value| *value);
-
     if has_nan { F::nan() } else { result }
 }
 
 #[macerator::with_simd]
-fn macerator_min<S: Simd, F: VOrd + ReduceMin + Float>(mut xs: &[F], init: F) -> F {
+fn macerator_min<S: Simd, F: VOrd + VMaskReduce + ReduceMin + Float>(mut xs: &[F], init: F) -> F {
     let lanes = F::lanes::<S>();
     let initial = init.splat::<S>();
     let mut acc = initial;
@@ -245,23 +254,13 @@ fn macerator_min<S: Simd, F: VOrd + ReduceMin + Float>(mut xs: &[F], init: F) ->
     }
 
     let mut result = acc.reduce_min();
-    let mut has_nan = false;
+    let mut has_nan = nan_mask.any();
     for &x in xs {
         has_nan |= x.is_nan();
         if x < result {
             result = x;
         }
     }
-
-    let mut nan_lanes = [false; 64];
-    assert!(
-        lanes <= nan_lanes.len(),
-        "SIMD f32 lane count {lanes} exceeds the supported maximum"
-    );
-    // SAFETY: `nan_lanes` is valid for 64 contiguous booleans, and the
-    // assertion above proves that the SIMD mask writes at most that many.
-    unsafe { nan_mask.store_as_bool(nan_lanes.as_mut_ptr()) };
-    has_nan |= nan_lanes[..lanes].iter().any(|value| *value);
 
     if has_nan { F::nan() } else { result }
 }

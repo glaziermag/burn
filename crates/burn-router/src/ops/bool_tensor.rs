@@ -8,10 +8,10 @@ use burn_backend::tensor::{BoolTensor, Device, FloatTensor, IndexingUpdateOp, In
 use burn_backend::{Scalar, Shape, Slice, TensorData};
 use burn_ir::{
     BaseOperationIr, BinaryOpIr, BoolOperationIr, CastOpIr, CatOpIr, CreationOpIr, FlipOpIr,
-    GatherOpIr, InitOperationIr, MaskFillOpIr, MaskWhereOpIr, OperationIr, OperationOutput,
-    PermuteOpIr, ReduceDimOpIr, ReduceOpIr, RepeatDimOpIr, ScalarOpIr, ScatterOpIr,
-    SelectAssignOpIr, SelectOpIr, ShapeOpIr, SliceAssignOpIr, SliceOpIr, SwapDimsOpIr, UnaryOpIr,
-    UnfoldOpIr,
+    GatherNdOpIr, GatherOpIr, InitOperationIr, MaskFillOpIr, MaskWhereOpIr, OperationIr,
+    OperationOutput, PermuteOpIr, ReduceDimOpIr, ReduceOpIr, RepeatDimOpIr, ScalarOpIr,
+    ScatterNdOpIr, ScatterOpIr, SelectAssignOpIr, SelectOpIr, ShapeOpIr, SliceAssignOpIr,
+    SliceOpIr, SwapDimsOpIr, UnaryOpIr, UnfoldOpIr,
 };
 
 impl<R: RouterChannel> BoolTensorOps<Self> for BackendRouter<R> {
@@ -81,11 +81,15 @@ impl<R: RouterChannel> BoolTensorOps<Self> for BackendRouter<R> {
             .output()
     }
 
-    fn bool_to_device(tensor: BoolTensor<Self>, device: &Device<Self>) -> BoolTensor<Self> {
-        if &tensor.client.device() == device {
+    fn bool_to_device(
+        tensor: BoolTensor<Self>,
+        device: &Device<Self>,
+        out_dtype: BoolDType,
+    ) -> BoolTensor<Self> {
+        if &tensor.client.device() == device && tensor.dtype == out_dtype.into() {
             return tensor;
         }
-        R::change_client_backend(tensor, device)
+        R::change_client_backend(tensor, device, out_dtype.into())
     }
 
     fn bool_reshape(tensor: BoolTensor<Self>, shape: Shape) -> BoolTensor<Self> {
@@ -361,11 +365,12 @@ impl<R: RouterChannel> BoolTensorOps<Self> for BackendRouter<R> {
             .output()
     }
 
-    fn bool_scatter_or(
+    fn bool_scatter(
         dim: usize,
         tensor: BoolTensor<Self>,
         indices: IntTensor<Self>,
         value: BoolTensor<Self>,
+        update: IndexingUpdateOp,
     ) -> BoolTensor<Self> {
         let client = tensor.client.clone();
         let desc = ScatterOpIr::create(
@@ -373,12 +378,43 @@ impl<R: RouterChannel> BoolTensorOps<Self> for BackendRouter<R> {
             dim,
             indices.into_ir(),
             value.into_ir(),
-            IndexingUpdateOp::Add,
+            update,
             || client.create_empty_handle(),
         );
 
         client
             .register(OperationIr::BaseBool(BaseOperationIr::Scatter(desc)))
+            .output()
+    }
+
+    fn bool_scatter_nd(
+        data: BoolTensor<Self>,
+        indices: IntTensor<Self>,
+        values: BoolTensor<Self>,
+        reduction: IndexingUpdateOp,
+    ) -> BoolTensor<Self> {
+        let client = data.client.clone();
+        let desc = ScatterNdOpIr::create(
+            data.into_ir(),
+            indices.into_ir(),
+            values.into_ir(),
+            reduction,
+            || client.create_empty_handle(),
+        );
+
+        client
+            .register(OperationIr::BaseBool(BaseOperationIr::ScatterNd(desc)))
+            .output()
+    }
+
+    fn bool_gather_nd(data: BoolTensor<Self>, indices: IntTensor<Self>) -> BoolTensor<Self> {
+        let client = data.client.clone();
+        let desc = GatherNdOpIr::create(data.into_ir(), indices.into_ir(), || {
+            client.create_empty_handle()
+        });
+
+        client
+            .register(OperationIr::BaseBool(BaseOperationIr::GatherNd(desc)))
             .output()
     }
 
@@ -410,11 +446,12 @@ impl<R: RouterChannel> BoolTensorOps<Self> for BackendRouter<R> {
             .output()
     }
 
-    fn bool_select_or(
+    fn bool_select_assign(
         tensor: BoolTensor<Self>,
         dim: usize,
         indices: IntTensor<Self>,
         value: BoolTensor<Self>,
+        update: IndexingUpdateOp,
     ) -> BoolTensor<Self> {
         let client = tensor.client.clone();
         let desc = SelectAssignOpIr::create(
@@ -422,7 +459,7 @@ impl<R: RouterChannel> BoolTensorOps<Self> for BackendRouter<R> {
             dim,
             indices.into_ir(),
             value.into_ir(),
-            IndexingUpdateOp::Add,
+            update,
             || client.create_empty_handle(),
         );
 

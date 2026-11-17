@@ -5,9 +5,9 @@ use alloc::vec::Vec;
 use burn_backend::{
     DType, ExecutionError, TensorData,
     ops::{BoolTensorOps, IntTensorOps},
-    tensor::{BoolTensor, Device, FloatTensor, IntTensor},
+    tensor::{BoolTensor, Device, FloatTensor, IndexingUpdateOp, IntTensor},
 };
-use burn_std::{Bytes, FloatDType, IntDType, Shape, Slice, bf16, f16};
+use burn_std::{BoolDType, BoolStore, Bytes, FloatDType, IntDType, Shape, Slice, bf16, f16};
 
 use crate::{Flex, FlexTensor, Layout};
 
@@ -20,8 +20,23 @@ impl BoolTensorOps<Flex> for Flex {
         Ok(tensor.into_data())
     }
 
-    fn bool_to_device(tensor: BoolTensor<Flex>, _device: &Device<Flex>) -> BoolTensor<Flex> {
-        tensor
+    fn bool_to_device(
+        tensor: BoolTensor<Flex>,
+        _device: &Device<Flex>,
+        out_dtype: BoolDType,
+    ) -> BoolTensor<Flex> {
+        if tensor.dtype() == out_dtype.into() {
+            return tensor;
+        }
+        match out_dtype {
+            BoolStore::Native => {
+                crate::ops::comparison::bool_not_equal_elem(tensor, false, out_dtype)
+            }
+            BoolStore::U8 => {
+                FlexTensor::from_arc(tensor.data_arc(), tensor.layout().clone(), out_dtype.into())
+            }
+            BoolStore::U32 => panic!("Flex does not support Bool(U32) storage"),
+        }
     }
 
     fn bool_cat(tensors: Vec<BoolTensor<Flex>>, dim: usize) -> BoolTensor<Flex> {
@@ -281,13 +296,27 @@ impl BoolTensorOps<Flex> for Flex {
         crate::ops::gather_scatter::gather_bool(tensor, dim, indices)
     }
 
-    fn bool_scatter_or(
+    fn bool_scatter(
         dim: usize,
         tensor: BoolTensor<Flex>,
         indices: IntTensor<Flex>,
         value: BoolTensor<Flex>,
+        update: IndexingUpdateOp,
     ) -> BoolTensor<Flex> {
-        crate::ops::gather_scatter::scatter_or(tensor, dim, indices, value)
+        crate::ops::gather_scatter::scatter_bool(tensor, dim, indices, value, update)
+    }
+
+    fn bool_scatter_nd(
+        data: BoolTensor<Flex>,
+        indices: IntTensor<Flex>,
+        values: BoolTensor<Flex>,
+        reduction: IndexingUpdateOp,
+    ) -> BoolTensor<Flex> {
+        crate::ops::gather_scatter::scatter_nd_bool(data, indices, values, reduction)
+    }
+
+    fn bool_gather_nd(data: BoolTensor<Flex>, indices: IntTensor<Flex>) -> BoolTensor<Flex> {
+        crate::ops::gather_scatter::gather_nd_bool(data, indices)
     }
 
     fn bool_equal_elem(lhs: BoolTensor<Flex>, rhs: burn_backend::Scalar) -> BoolTensor<Flex> {
@@ -357,16 +386,17 @@ impl BoolTensorOps<Flex> for Flex {
         dim: usize,
         indices: IntTensor<Flex>,
     ) -> BoolTensor<Flex> {
-        crate::ops::gather_scatter::select::<u8>(tensor, dim, indices)
+        crate::ops::gather_scatter::select_bool(tensor, dim, indices)
     }
 
-    fn bool_select_or(
+    fn bool_select_assign(
         tensor: BoolTensor<Flex>,
         dim: usize,
         indices: IntTensor<Flex>,
         value: BoolTensor<Flex>,
+        update: IndexingUpdateOp,
     ) -> BoolTensor<Flex> {
-        crate::ops::gather_scatter::select_or(tensor, dim, indices, value)
+        crate::ops::gather_scatter::select_assign_bool(tensor, dim, indices, value, update)
     }
 
     fn bool_transpose(tensor: BoolTensor<Flex>) -> BoolTensor<Flex> {

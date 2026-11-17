@@ -1,15 +1,9 @@
 use tracel_xtask::{
     prelude::{clap::ValueEnum, *},
-    utils::{
-        process::{ExitSignal, ProcessExitError, run_process},
-        workspace::WorkspaceMember,
-    },
+    utils::process::run_process,
 };
 
 use crate::NO_STD_CRATES;
-
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 
 #[macros::extend_command_args(TestCmdArgs, Target, TestSubCommand)]
 pub struct BurnTestCmdArgs {
@@ -35,7 +29,10 @@ impl std::convert::TryInto<CompileCmdArgs> for BurnTestCmdArgs {
 pub enum CiTestType {
     // Github runner shards
     Backends,
+    /// Workspace defaults and graph capture.
     Crates,
+    /// Dataset, remote, vision, and training feature configurations.
+    CratesFeatures,
     Examples,
     // Other runners
     GithubRunner,
@@ -60,8 +57,6 @@ pub(crate) enum TestBackend {
     Rocm,
     #[strum(to_string = "flex")]
     Flex,
-    #[strum(to_string = "ndarray")]
-    Ndarray,
 }
 
 fn set_burn_device(device: &str) {
@@ -86,27 +81,25 @@ pub(crate) fn handle_backend_tests(
 
     let linalg_backend = format!("burn-linalg/{backend_name}");
     let signal_backend = format!("burn-signal/{backend_name}");
-    let mut extension_packages = vec!["burn-linalg"];
+    let extension_packages = vec!["burn-linalg", "burn-signal"];
     let mut extension_features = vec![linalg_backend.as_str()];
     if !matches!(context, Context::NoStd) {
         extension_features.extend(["burn-linalg/std", "burn-linalg/autotune"]);
     }
-    // Signal has no NdArray implementation; keep its suite on supported backends.
-    if !matches!(backend, TestBackend::Ndarray) {
-        extension_packages.push("burn-signal");
-        extension_features.extend([signal_backend.as_str(), "burn-signal/autodiff"]);
-        if !matches!(context, Context::NoStd) {
-            extension_features.extend(["burn-signal/std", "burn-signal/autotune"]);
-        }
+    extension_features.extend([signal_backend.as_str(), "burn-signal/autodiff"]);
+    if !matches!(context, Context::NoStd) {
+        extension_features.extend(["burn-signal/std", "burn-signal/autotune"]);
     }
 
-    if matches!(backend, TestBackend::Cuda) {
-        // Collective (all-reduce) tests require a CUDA build with NCCL, which the CI runner
-        // provides. Kept behind its own feature so plain `--features cuda` still works without it.
-        test_args.extend(["--features", "distributed"]);
-    }
+    // TODO: Re-enable collective (all-reduce) tests once NCCL is installed and loadable on
+    // the CUDA CI runners. The documented runner image setup does not install NCCL.
+    // if matches!(backend, TestBackend::Cuda) {
+    //     // Collective (all-reduce) tests require a CUDA build with NCCL, which the CI runner
+    //     // provides. Kept behind its own feature so plain `--features cuda` still works without it.
+    //     test_args.extend(["--features", "distributed"]);
+    // }
 
-    if !matches!(backend, TestBackend::Ndarray | TestBackend::Flex) {
+    if !matches!(backend, TestBackend::Flex) {
         // Fusion enabled tests first
         let mut fusion_args = test_args.clone();
         fusion_args.extend(["--features", "fusion"]);
@@ -129,8 +122,48 @@ pub(crate) fn handle_backend_tests(
         )?;
     }
 
-    let group_cpu_tests = matches!(backend, TestBackend::Ndarray | TestBackend::Flex)
-        && matches!(context, Context::Std);
+    if matches!(backend, TestBackend::Wgpu) && matches!(context, Context::Std) {
+        for (features, remote_features) in [
+            ("std,cpu,wgpu,fusion", "client,server,websocket,fusion"),
+            ("std,cpu,wgpu", "client,server,websocket"),
+        ] {
+            build_helpers::custom_crates_tests(
+                vec!["burn-backend-tests"],
+                handle_test_args(
+                    &[
+                        "--no-default-features",
+                        "--features",
+                        features,
+                        "--test",
+                        "bool_transfer",
+                    ],
+                    args.release,
+                ),
+                None,
+                None,
+                "CPU/WGSL bool transfer tests",
+            )?;
+            build_helpers::custom_crates_tests(
+                vec!["burn-remote"],
+                handle_test_args(
+                    &[
+                        "--no-default-features",
+                        "--features",
+                        remote_features,
+                        "--test",
+                        "websocket",
+                        "bool_transfer::",
+                    ],
+                    args.release,
+                ),
+                None,
+                None,
+                "remote bool transfer tests",
+            )?;
+        }
+    }
+
+    let group_cpu_tests = matches!(backend, TestBackend::Flex) && matches!(context, Context::Std);
     if group_cpu_tests {
         // Keep each backend separate, and leave SIMD/threading defaults to the
         // standalone backend crate tests. The extension suites request autotuning.
@@ -155,28 +188,59 @@ pub(crate) fn handle_backend_tests(
         )?;
     }
 
-    if matches!(backend, TestBackend::Flex) {
-        // These targets each need a second backend. Keep them out of the main suite, where
-        // ndarray disables some Flex-specific tests.
-        let mut transfer_args = test_args.clone();
-        transfer_args.extend(["--features", "ndarray", "--test", "autodiff_transfer"]);
-        build_helpers::custom_crates_tests(
-            vec!["burn-backend-tests"],
-            handle_test_args(&transfer_args, args.release),
+    if matches!(backend, TestBackend::Flex) && matches!(context, Context::Std) {
+        // These targets need two concrete backends. Keep CPU runtime dependencies out of
+        // the portable/no-std suites and run the shared suites with only Flex selected.
+        let features = [
+            "burn-backend-tests/flex,burn-backend-tests/cpu,burn-backend-tests/std",
+            "burn-core/flex,burn-core/cpu,burn-core/std",
+            "burn-dispatch/flex,burn-dispatch/cpu,burn-dispatch/std,burn-dispatch/autodiff",
+            "burn/flex,burn/cpu,burn/std,burn/autodiff,burn/extension,burn/optim",
+        ]
+        .join(",");
+        // Dispatch unit tests and transfer integration targets share the same CPU stack.
+        // Keep defaults disabled so the transfer tests do not enable fusion.
+        group!("Tests: Flex/CPU transfer integration tests");
+        let result = run_process(
+            "cargo",
+            &handle_test_args(
+                &[
+                    "test",
+                    "--color",
+                    "always",
+                    "--no-default-features",
+                    "-p",
+                    "burn-backend-tests",
+                    "-p",
+                    "burn-dispatch",
+                    "-p",
+                    "burn-core",
+                    "-p",
+                    "burn",
+                    "--features",
+                    &features,
+                    "--lib",
+                    "--test",
+                    "autodiff_transfer",
+                    "--test",
+                    "lazy_param_device",
+                    "--test",
+                    "layer_placement",
+                    "--test",
+                    "backend_extension_runtime",
+                    "--test",
+                    "autodiff_signal",
+                    "--test",
+                    "training_pipeline",
+                ],
+                args.release,
+            ),
             None,
             None,
-            "autodiff backend transfer tests",
-        )?;
-
-        let mut placement_args = test_args.clone();
-        placement_args.extend(["--features", "ndarray", "--test", "lazy_param_device"]);
-        build_helpers::custom_crates_tests(
-            vec!["burn-core"],
-            handle_test_args(&placement_args, args.release),
-            None,
-            None,
-            "lazy parameter placement tests",
-        )?;
+            "Flex/CPU transfer tests",
+        );
+        endgroup!();
+        result?;
     }
 
     if !group_cpu_tests {
@@ -190,53 +254,37 @@ pub(crate) fn handle_backend_tests(
     Ok(())
 }
 
-fn handle_wgpu_test(member: &str, args: &TestCmdArgs) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    let filter_err = |e: &&ProcessExitError| {
-        e.status.signal() == Some(11) || matches!(e.signal, Some(ExitSignal { code: 11, .. }))
-    };
-    #[cfg(not(unix))]
-    let filter_err = |e: &&ProcessExitError| matches!(e.signal, Some(ExitSignal { code: 11, .. }));
-
-    let workspace_member = WorkspaceMember {
-        name: member.into(),
-        path: "".into(), // unused
-    };
-
-    if let Err(err) = base_commands::test::run_unit_test(&workspace_member, args) {
-        let should_ignore = err
-            .downcast_ref::<ProcessExitError>()
-            .filter(filter_err)
-            // Failed to execute unit test for '{member}'
-            .map(|e| e.message.contains(member))
-            .unwrap_or(false);
-
-        if should_ignore {
-            // Ignore intermittent successful failures
-            // https://github.com/gfx-rs/wgpu/issues/2949
-            // https://github.com/KhronosGroup/Vulkan-ValidationLayers/issues/4391
-            eprintln!("⚠️ Ignored SIGSEGV in wgpu test");
-        } else {
-            return Err(err);
-        }
+fn run_crate_unit_tests(packages: &[&str], args: &TestCmdArgs) -> anyhow::Result<()> {
+    let mut selected = args.clone();
+    selected.only = packages
+        .iter()
+        .filter(|package| args.only.is_empty() || args.only.iter().any(|only| only == *package))
+        .map(|package| (*package).to_owned())
+        .collect();
+    // An empty selection means all crates to xtask, so skip an empty intersection.
+    if selected.only.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    base_commands::test::run_unit(&Target::Crates, &selected)
 }
 
 /// Compile compatible Metal suites together instead of rebuilding their shared GPU stack
 /// for every package. Keep defaults out of the non-fusion group: the WGPU, core, and
 /// vision defaults enable fusion transitively.
+///
+/// The suites run on wgpu's Metal path: cubecl's own Metal runtime needs Metal 3, which the
+/// GitHub macOS runners' paravirtual device lacks.
 fn handle_macos_tests(release: bool) -> anyhow::Result<()> {
-    set_burn_device("metal");
+    set_burn_device("wgpu-msl");
 
     let packages = ["burn-backend-tests", "burn-linalg", "burn-signal"];
     let features = [
-        "burn-backend-tests/metal",
+        "burn-backend-tests/wgpu-msl",
         "burn-backend-tests/std",
-        "burn-linalg/metal",
+        "burn-linalg/wgpu-msl",
         "burn-linalg/std",
         "burn-linalg/autotune",
-        "burn-signal/metal",
+        "burn-signal/wgpu-msl",
         "burn-signal/std",
         "burn-signal/autodiff",
         "burn-signal/autotune",
@@ -249,16 +297,16 @@ fn handle_macos_tests(release: bool) -> anyhow::Result<()> {
         "burn-backend-tests/fusion",
         "burn-linalg/fusion",
         "burn-signal/fusion",
-        // Extension tests share this Metal/Fusion build and use BURN_DEVICE=metal.
+        // Extension tests share this Metal/Fusion build and use BURN_DEVICE=wgpu-msl.
         "burn-core/extension-tests",
         // Preserve the default-feature coverage of the former standalone crate tests.
         // Qualify every feature so adding a package cannot enable its namesake feature.
         "burn-wgpu/default",
-        "burn-wgpu/metal",
+        "burn-wgpu/wgpu-msl",
         "burn-core/default",
-        "burn-core/metal",
+        "burn-core/wgpu-msl",
         "burn-vision/default",
-        "burn-vision/metal",
+        "burn-vision/wgpu-msl",
     ]);
     run_test_group(
         &fusion_packages,
@@ -266,17 +314,7 @@ fn handle_macos_tests(release: bool) -> anyhow::Result<()> {
         release,
         "Metal with fusion",
     )?;
-    run_test_group(&packages, &features, release, "Metal without fusion")?;
-
-    // Keep Accelerate separate so it cannot change the ndarray reference backend used
-    // by the Metal tests. It also doesn't need to compile the GPU dependencies.
-    build_helpers::custom_crates_tests(
-        vec!["burn-ndarray"],
-        handle_test_args(&["--features", "blas-accelerate"], release),
-        None,
-        None,
-        "std blas-accelerate",
-    )
+    run_test_group(&packages, &features, release, "Metal without fusion")
 }
 
 fn run_test_group(
@@ -313,13 +351,11 @@ const EXCLUDE_CRATES: &[&str] = &[
     "burn-rocm",
     // "burn-router" uses "burn-wgpu" for the tests.
     "burn-router",
-    "burn-tch",
     "burn-wgpu",
     // Requires wgpu runtime
     "burn-cubecl-fusion",
     // Backends are tested individually
     "burn-backend-tests",
-    "burn-ndarray",
     "burn-flex",
 ];
 
@@ -381,11 +417,131 @@ fn feature_test_group(
     )
 }
 
+/// Run the requested workspace configurations without widening their feature sets.
+fn handle_crate_tests(
+    mut args: BurnTestCmdArgs,
+    env: Environment,
+    context: Context,
+) -> anyhow::Result<()> {
+    // Default `Target::Workspace`
+    // Exclude crates that are not supported on CI
+    args.exclude
+        .extend(EXCLUDE_CRATES.iter().map(|&s| s.to_string()));
+    // Exclude examples
+    // workspace feature unification will cause binary bloat with examples default features
+    args.exclude.extend(enumerate_examples()?);
+
+    // Burn remote tests don't work on windows for now
+    #[cfg(target_os = "windows")]
+    {
+        args.exclude.extend(vec!["burn-remote".to_string()]);
+    };
+
+    if matches!(args.ci, CiTestType::Crates) {
+        // Select the execution backend explicitly now that defaults are backend-free.
+        let metadata = cargo_metadata::MetadataCommand::new().no_deps().exec()?;
+        let (_, features) = feature_test_group(&metadata, "flex", &args.exclude);
+        args.features.get_or_insert_with(Vec::new).extend(features);
+        // The linalg-backed layers are opt-in; keep their tests covered.
+        if !args.exclude.iter().any(|name| name == "burn-nn") {
+            args.features
+                .get_or_insert_with(Vec::new)
+                .push("burn-nn/linalg".to_string());
+        }
+        set_burn_device("flex"); // default device for base tests
+        base_commands::test::handle_command(
+            args.clone().try_into().unwrap(),
+            env.clone(),
+            context.clone(),
+        )?;
+        // Capture is intentionally opt-in, so workspace-default tests don't compile
+        // the dispatch, tensor, core, or facade integration tests that exercise it.
+        if !args.exclude.iter().any(|name| name == "burn") {
+            super::validate::check_backend_features()?;
+        }
+        let metadata = cargo_metadata::MetadataCommand::new().no_deps().exec()?;
+        let (packages, features) = feature_test_group(&metadata, "capture", &args.exclude);
+        run_test_group(
+            &packages.iter().map(String::as_str).collect::<Vec<_>>(),
+            &features.iter().map(String::as_str).collect::<Vec<_>>(),
+            args.release,
+            "std with graph capture",
+        )?;
+    } else {
+        // The relocated websocket FFT test requires explicit server features.
+        #[cfg(target_os = "linux")]
+        if !args.exclude.iter().any(|name| name == "burn-signal") {
+            for features in ["flex,std,remote-tests", "flex,std,remote-tests,fusion"] {
+                build_helpers::custom_crates_tests(
+                    vec!["burn-signal"],
+                    handle_test_args(
+                        &[
+                            "--no-default-features",
+                            "--features",
+                            features,
+                            "--test",
+                            "remote",
+                        ],
+                        args.release,
+                    ),
+                    None,
+                    None,
+                    "signal FFT over websocket",
+                )?;
+            }
+        }
+
+        // Keep all-features coverage in this shard to avoid consuming
+        // another runner from the organization's concurrency limit.
+        build_helpers::custom_crates_tests(
+            vec!["burn-dataset"],
+            handle_test_args(&["--all-features"], args.release),
+            None,
+            None,
+            "std dataset all features",
+        )?;
+
+        // Both suites use Flex; share their training and model dependencies.
+        set_burn_device("flex");
+        run_test_group(
+            &["burn-vision", "burn-train"],
+            &[
+                "burn-vision/default",
+                "burn-vision/flex",
+                "burn-vision/loss",
+                "burn-train/default",
+                "burn-train/rl",
+                "burn-train/vision",
+            ],
+            args.release,
+            "std vision and training (flex)",
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn handle_command(
     mut args: BurnTestCmdArgs,
     env: Environment,
     context: Context,
 ) -> anyhow::Result<()> {
+    if cfg!(target_os = "linux")
+        && matches!(
+            args.ci,
+            CiTestType::GcpWgpuRunner | CiTestType::GcpVulkanRunner
+        )
+    {
+        // These GCP runners use x86_64 Linux. Handle shutdown crashes per test binary so
+        // Cargo still runs the remaining integration tests and preserves real failures.
+        // TODO: Investigate GPU shutdown and remove this workaround once it is fixed.
+        let mut runner = std::env::current_exe()?.into_os_string();
+        runner.push(" wgpu-test-runner");
+        // SAFETY: xtask configures the environment before spawning test processes.
+        unsafe {
+            std::env::set_var("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER", runner);
+        }
+    }
+
     match context {
         Context::NoStd => {
             // burn-flex's unit tests use `std::f32::consts` and bare `vec!`
@@ -411,11 +567,7 @@ pub(crate) fn handle_command(
                     "no-std",
                 )
             })?;
-            handle_backend_tests(
-                args.clone().try_into().unwrap(),
-                TestBackend::Ndarray,
-                context,
-            )?;
+            handle_backend_tests(args.clone().try_into().unwrap(), TestBackend::Flex, context)?;
 
             Ok(())
         }
@@ -427,23 +579,8 @@ pub(crate) fn handle_command(
                     // Backend ops
                     handle_backend_tests(
                         args.clone().try_into().unwrap(),
-                        TestBackend::Ndarray,
-                        context.clone(),
-                    )?;
-
-                    handle_backend_tests(
-                        args.clone().try_into().unwrap(),
                         TestBackend::Flex,
                         context.clone(),
-                    )?;
-
-                    // Backend crates
-                    args.target = Target::AllPackages;
-                    args.only.push("burn-ndarray".to_string());
-                    base_commands::test::handle_command(
-                        args.clone().try_into().unwrap(),
-                        env.clone(),
-                        context,
                     )?;
 
                     // Native FFT kernels are opt-in, but keep their backend unit tests covered.
@@ -455,31 +592,8 @@ pub(crate) fn handle_command(
                         "Flex backend with FFT kernels",
                     )?;
                 }
-                CiTestType::Crates => {
-                    // Default `Target::Workspace`
-                    // Exclude crates that are not supported on CI
-                    args.exclude
-                        .extend(EXCLUDE_CRATES.iter().map(|&s| s.to_string()));
-                    // Exclude examples
-                    // workspace feature unification will cause binary bloat with examples default features
-                    args.exclude.extend(enumerate_examples()?);
-
-                    // Burn remote tests don't work on windows for now
-                    #[cfg(target_os = "windows")]
-                    {
-                        args.exclude.extend(vec!["burn-remote".to_string()]);
-                    };
-
-                    // Select the execution backend explicitly now that defaults are backend-free.
-                    let metadata = cargo_metadata::MetadataCommand::new().no_deps().exec()?;
-                    let (_, features) = feature_test_group(&metadata, "flex", &args.exclude);
-                    args.features.get_or_insert_with(Vec::new).extend(features);
-                    set_burn_device("flex"); // default device for base tests
-                    base_commands::test::handle_command(
-                        args.clone().try_into().unwrap(),
-                        env.clone(),
-                        context.clone(),
-                    )?;
+                CiTestType::Crates | CiTestType::CratesFeatures => {
+                    handle_crate_tests(args.clone(), env.clone(), context.clone())?;
                 }
                 CiTestType::Examples => {
                     // NOTE: for the examples we simply run `cargo checks` (no tests, faster validation)
@@ -509,7 +623,6 @@ pub(crate) fn handle_command(
                         context,
                     )?;
 
-                    args.target = Target::AllPackages;
                     let mut args_vulkan = args.clone();
                     args_vulkan
                         .features
@@ -517,17 +630,14 @@ pub(crate) fn handle_command(
                         .push("vulkan".to_string());
 
                     let args_vulkan = args_vulkan.try_into().unwrap();
-                    handle_wgpu_test("burn-wgpu", &args_vulkan)?;
-                    handle_wgpu_test("burn-core", &args_vulkan)?;
-                    handle_wgpu_test("burn-vision", &args_vulkan)?;
+                    run_crate_unit_tests(&["burn-wgpu", "burn-core", "burn-vision"], &args_vulkan)?;
 
                     // Enable burn-core/vulkan
                     args.features
                         .get_or_insert_with(Vec::new)
                         .push("burn-core/vulkan".to_string());
                     let args_vulkan = args.clone().try_into().unwrap();
-                    handle_wgpu_test("burn-optim", &args_vulkan)?;
-                    handle_wgpu_test("burn-nn", &args_vulkan)?;
+                    run_crate_unit_tests(&["burn-optim", "burn-nn"], &args_vulkan)?;
                 }
                 CiTestType::GcpWgpuRunner => {
                     handle_backend_tests(
@@ -535,8 +645,10 @@ pub(crate) fn handle_command(
                         TestBackend::Wgpu,
                         context,
                     )?;
-                    args.target = Target::AllPackages;
-                    handle_wgpu_test("burn-cubecl-fusion", &args.clone().try_into().unwrap())?;
+                    run_crate_unit_tests(
+                        &["burn-cubecl-fusion"],
+                        &args.clone().try_into().unwrap(),
+                    )?;
 
                     let mut args_wgpu = args.clone();
                     args_wgpu
@@ -545,103 +657,17 @@ pub(crate) fn handle_command(
                         .push("webgpu".to_string());
 
                     let args_wgpu = args_wgpu.try_into().unwrap();
-                    handle_wgpu_test("burn-wgpu", &args_wgpu)?;
-                    handle_wgpu_test("burn-core", &args_wgpu)?;
-                    handle_wgpu_test("burn-vision", &args_wgpu)?;
+                    run_crate_unit_tests(&["burn-wgpu", "burn-core", "burn-vision"], &args_wgpu)?;
 
                     // Enable burn-core/webgpu
                     args.features
                         .get_or_insert_with(Vec::new)
                         .push("burn-core/webgpu".to_string());
                     let args_wgpu = args.clone().try_into().unwrap();
-                    handle_wgpu_test("burn-optim", &args_wgpu)?;
-                    handle_wgpu_test("burn-nn", &args_wgpu)?;
+                    run_crate_unit_tests(&["burn-optim", "burn-nn"], &args_wgpu)?;
                 }
             }
 
-            // 2) Specific additional commands to test specific features
-            // ---------------------------------------------------------
-            match args.ci {
-                CiTestType::Backends | CiTestType::GithubRunner => (),
-                CiTestType::Examples => (),
-                CiTestType::Crates => {
-                    // Capture is intentionally opt-in, so workspace-default tests don't compile
-                    // the dispatch, tensor, core, or facade integration tests that exercise it.
-                    if !args.exclude.iter().any(|name| name == "burn") {
-                        super::validate::check_backend_features()?;
-                    }
-                    let metadata = cargo_metadata::MetadataCommand::new().no_deps().exec()?;
-                    let (packages, features) =
-                        feature_test_group(&metadata, "capture", &args.exclude);
-                    run_test_group(
-                        &packages.iter().map(String::as_str).collect::<Vec<_>>(),
-                        &features.iter().map(String::as_str).collect::<Vec<_>>(),
-                        args.release,
-                        "std with graph capture",
-                    )?;
-
-                    // The relocated websocket FFT test requires explicit server features.
-                    #[cfg(target_os = "linux")]
-                    if !args.exclude.iter().any(|name| name == "burn-signal") {
-                        for features in ["flex,std,remote-tests", "flex,std,remote-tests,fusion"] {
-                            build_helpers::custom_crates_tests(
-                                vec!["burn-signal"],
-                                handle_test_args(
-                                    &[
-                                        "--no-default-features",
-                                        "--features",
-                                        features,
-                                        "--test",
-                                        "remote",
-                                    ],
-                                    args.release,
-                                ),
-                                None,
-                                None,
-                                "signal FFT over websocket",
-                            )?;
-                        }
-                    }
-
-                    // Keep all-features coverage in this shard to avoid consuming
-                    // another runner from the organization's concurrency limit.
-                    build_helpers::custom_crates_tests(
-                        vec!["burn-dataset"],
-                        handle_test_args(&["--all-features"], args.release),
-                        None,
-                        None,
-                        "std dataset all features",
-                    )?;
-
-                    // burn-core
-                    set_burn_device("tch"); // test-tch
-                    build_helpers::custom_crates_tests(
-                        vec!["burn-core"],
-                        handle_test_args(&["--features", "tch"], args.release),
-                        None,
-                        None,
-                        "std with features: tch",
-                    )?;
-
-                    // Both suites use Flex; share their training and model dependencies.
-                    set_burn_device("flex");
-                    run_test_group(
-                        &["burn-vision", "burn-train"],
-                        &[
-                            "burn-vision/default",
-                            "burn-vision/flex",
-                            "burn-vision/loss",
-                            "burn-train/default",
-                            "burn-train/rl",
-                            "burn-train/vision",
-                        ],
-                        args.release,
-                        "std vision and training (flex)",
-                    )?;
-                }
-                CiTestType::GcpCudaRunner | CiTestType::GithubMacRunner => (),
-                CiTestType::GcpVulkanRunner | CiTestType::GcpWgpuRunner => (), // handled in tests above
-            }
             Ok(())
         }
         Context::All => Context::value_variants()

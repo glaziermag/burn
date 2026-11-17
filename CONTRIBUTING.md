@@ -9,23 +9,41 @@ and find one that interests you. Issues labeled `good first issue` are a great s
 new contributors.
 
 If you have an idea that isn't covered by an existing issue, open one first to discuss the approach.
-This helps align expectations and avoids wasted effort on both sides.
+Keep the issue description succinct and focused on the problem and relevant evidence. This helps
+align expectations and avoids wasted effort on both sides.
 
 For questions, discussions, or just to say hello, join us on
-[Discord](https://discord.gg/uPEBbYYDB6). The [Contributor Book](https://burn.dev/contributor-book/)
-covers architecture, environment setup, and guides for common tasks.
+[Discord](https://discord.gg/uPEBbYYDB6). The
+[Contributor Book](https://burn.dev/books/contributor/) covers architecture, environment setup, and
+guides for common tasks.
+
+Coding agents should also read [AGENTS.md](AGENTS.md) for repository guidance and PR disclosure
+instructions.
 
 ## Pull Requests
 
-Every pull request should have a descriptive title, a description covering what you changed, why,
-how you tested it, and a link to the relevant issue (if applicable). Prefer small, focused PRs over
-large ones that bundle unrelated changes.
+Every pull request should have a descriptive title and a short description of the problem, solution,
+and validation, with a link to the relevant issue (if applicable). A few sentences plus test results
+are enough for a simple change. Add detail only when needed to assess its behavior or design; avoid
+repeating the diff. Prefer small, focused PRs over large ones that bundle unrelated changes.
 
 Draft pull requests are considered not yet ready for review.
 
 CI checks should pass before requesting review, though the signal isn't always accurate. If you have
 questions or need early feedback, let us know on the PR or on
 [Discord](https://discord.gg/uPEBbYYDB6).
+
+### PR Titles and Commit Messages
+
+Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for PR titles:
+`type(scope): description`. The scope is optional; use it to identify the affected component.
+
+Mark breaking changes relative to the latest official release with `!` before the colon, and explain
+their impact and migration in the PR description. Changes limited to unreleased features do not
+require `!`; document any impact on users tracking `main` in the PR description.
+
+Before merging, ensure the squash commit title or each rebased commit follows this convention.
+Intermediate commits that will be squashed are exempt.
 
 ### Change Ownership
 
@@ -39,7 +57,7 @@ own it intellectually and can stand behind it during review.
 
 ### AI-Assisted Contributions
 
-Using LLMs and AI tools to generate code that is part of a contribution is allowed.
+Using LLMs and AI tools to help with a contribution is allowed.
 
 That said, the [Change Ownership](#change-ownership) principle applies fully. You are the author,
 not your AI tool. This means:
@@ -51,12 +69,23 @@ not your AI tool. This means:
 
 Do not use "AI generated" as a justification for low-quality code.
 
+Remove the AI Usage section of the [PR template](.github/pull_request_template.md) if no AI tools
+were used. Otherwise, briefly disclose their use, distinguishing assistance with specific tasks from
+most or all of the work being carried out autonomously. State if an agent wrote the description or
+created the PR.
+
+Keep issue and PR descriptions and comments succinct. Edit generated text for accuracy and brevity
+before submitting, and avoid large blocks of unedited AI prose.
+
+Keep AI disclosure in the PR description and omit AI coauthor or generated-by trailers from commit
+messages.
+
 ### Before You Open a PR
 
 1. **Check for an existing issue.** If there isn't one, open an issue first to discuss the approach.
    This is especially important for large changes or refactors.
 2. **Read the codebase.** Understand the architecture and conventions already in place. The
-   [Contributor Book](https://burn.dev/contributor-book/) covers architecture, environment setup,
+   [Contributor Book](https://burn.dev/books/contributor/) covers architecture, environment setup,
    and guides for common tasks.
 3. **Keep it focused.** One PR should address one concern. If you spot an unrelated issue while
    working, open a separate PR for it.
@@ -80,6 +109,46 @@ Prioritize documentation changes that improve correctness or understanding, such
 explanations, broken examples, or misleading API documentation. Maintainers may close purely
 cosmetic PRs to preserve review capacity.
 
+### Changelog
+
+User-visible changes must be recorded under `Unreleased` in
+[burn-book/src/changelog.md](burn-book/src/changelog.md) in the same PR. This includes public API
+and behavior changes, new functionality, significant bug fixes, and notable performance
+improvements. Internal refactors, test-only changes, and editorial corrections generally do not need
+entries.
+
+For CubeCL and CubeK updates, record significant user-visible benefits that Burn actually uses or
+exposes, rather than the version bump itself. Omit upstream refactors and capabilities not yet used
+by Burn.
+
+Keep `Unreleased` in this single file, organized into stable `###` subject groups with narrowly scoped
+feature subsections alphabetized within each group. Under `Extensions`, group changes by extension
+(linear algebra, signal processing, vision), then by feature. Place changes according to the API users
+interact with: a module's `linalg` feature requirement belongs under `Modules`, while a new Cholesky
+operation belongs under `Extensions`.
+
+Add changes to the most specific existing feature subsection, or create one for an independent
+feature, even for a single bullet. Group related API changes, additions, fixes, and performance
+improvements together. Keep entries in feature subsections rather than directly under subject groups
+or catch-all lists such as "Other fixes", so unrelated PRs are less likely to edit the same location.
+
+Keep entries concise and describe the impact on users. Major features can use paragraphs and short
+API examples; smaller changes can remain bullets. Mark breaking changes explicitly and state what
+users need to replace or update. Keep each entry's explanation, migration steps, PR links, and author
+credits together, with a blank line between entries.
+
+Update existing entries for follow-up work, describing the resulting behavior and migration from the
+last release. Remove superseded guidance; retain relevant PR links and attribution.
+
+Keep ordinary PRs focused on their own entries. Avoid renaming or moving unrelated sections,
+reordering unrelated entries, or rewrapping the whole file. Leave broader consolidation and editorial
+changes for release preparation.
+
+At release time, consolidate related entries into the release notes and any migration guide. Order
+the published notes by user impact, leading with standout capabilities and substantial performance
+improvements; keep migration guidance with the relevant features. Then clear the pending entries.
+Published release history lives in GitHub Releases.
+
 ### Large Pull Requests
 
 Large, complex PRs are harder to review effectively and carry more risk. To help both yourself and
@@ -93,6 +162,8 @@ early than after the work is done.
 ### Review Process
 
 - Maintainers review PRs as time allows. Please be patient.
+- Maintainers evaluate the findings and remain responsible for final review and merge decisions.
+  Agent-generated reviews should be identified as such.
 - Be responsive to feedback. If changes are requested, address them or explain your reasoning.
 - Reviewers may ask clarifying questions about any part of your PR. This is a normal part of
   collaborative review and helps ensure shared understanding.

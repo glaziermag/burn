@@ -1,13 +1,10 @@
 use crate::{
     CubeTuneId,
-    kernel::{
-        autotune_bounds,
-        interpolate::{execute_interpolate, map_options},
-    },
+    kernel::interpolate::{execute_interpolate, map_options},
     ops::permute_nchw_to_nhwc_shape,
     tensor::CubeTensor,
 };
-use burn_backend::cubecl::dtype_to_elem_type;
+use burn_backend::cubecl::{autotune::with_roofline_bounds, dtype_to_elem_type};
 use burn_backend::ops::InterpolateOptions;
 use cubecl::{
     std::throughput::roofline_bounds,
@@ -21,28 +18,23 @@ use cubek::interpolate::{
 
 type Inputs = (CubeTensor, [usize; 2], InterpolateOptions);
 
-/// What the tuner measures: the bottleneck each strategy takes for granted.
+/// What the tuner measures: cubek's two interpolate routines, each at the settings cubek's
+/// selector picks for the problem and the device.
 ///
-/// The geometry behind them is cubek's to pick, from the device and the problem, so nothing here
-/// enumerates plane counts or row runs. On a GPU the two differ in how much of a cube one problem
-/// occupies and in whether the gathered input is staged, which is the choice that swings a run
-/// either way and is therefore measured rather than modelled. A CPU resolves both to one
-/// blueprint, and both stay registered there rather than being filtered: the tunable set is built
-/// once per process and shared by every device in it, so it cannot be cut to the first device's
-/// kind. The cost is one duplicate measurement per key.
+/// On a GPU the two differ in how much of a cube one problem occupies and in whether the gathered
+/// input is staged, which is the choice that swings a run either way and is therefore measured
+/// rather than modelled. A CPU runs both as one kernel, and both stay registered there rather than
+/// being filtered: the tunable set is built once per process and shared by every device in it, so
+/// it cannot be cut to the first device's kind. The cost is one duplicate measurement per key.
 ///
-/// [`MaximizeThroughput`](InterpolateStrategy::MaximizeThroughput) leads, because it stages
-/// nothing and so is the one no device refuses: the short circuit gets its first chance on a
-/// candidate that always runs.
+/// [`Cube`](InterpolateStrategy::Cube) leads, because it stages nothing and so is the one no
+/// device refuses: the short circuit gets its first chance on a candidate that always runs.
 ///
 /// The names are spelled out rather than derived from the variants, because a recorded tune result
 /// is keyed by them and renaming a variant must not silently invalidate one.
 const STRATEGIES: [(&str, InterpolateStrategy); 2] = [
-    (
-        "maximize_throughput",
-        InterpolateStrategy::MaximizeThroughput,
-    ),
-    ("minimize_latency", InterpolateStrategy::MinimizeLatency),
+    ("cube", InterpolateStrategy::Cube),
+    ("cube_staged", InterpolateStrategy::CubeStaged),
 ];
 
 /// Interpolate operation with autotuning. This benchmarks multiple strategies and selects the
@@ -81,7 +73,7 @@ pub fn interpolate_autotune(
 fn with_bounds<Out: 'static>(
     set: TunableSet<InterpolateAutotuneKey, Inputs, Out>,
 ) -> TunableSet<InterpolateAutotuneKey, Inputs, Out> {
-    autotune_bounds::with_bounds(
+    with_roofline_bounds(
         set,
         |_key, (input, output_size, options): &Inputs, thresholds| {
             let problem = forward_problem(input, output_size, options);
@@ -104,12 +96,13 @@ fn forward_problem(
     output_size: &[usize; 2],
     options: &InterpolateOptions,
 ) -> InterpolateForwardProblem {
+    let [_, _, in_height, in_width] = input.meta.shape().dims();
     let shape = permute_nchw_to_nhwc_shape(input.meta.shape().clone());
 
     InterpolateForwardProblem::from_input_output_shapes(
         &shape,
         output_size,
-        map_options(options.clone()),
+        map_options(options, [in_height, in_width], *output_size),
     )
 }
 

@@ -2,6 +2,9 @@ use alloc::format;
 
 use burn::tensor::module::interpolate;
 
+use crate::modules::bounds::{self, Windowing};
+use burn::instrument::{Bounds, compute};
+use burn::tensor::module::interpolate_output_size;
 use burn_core as burn;
 
 use burn::config::Config;
@@ -18,12 +21,13 @@ use super::InterpolateMode;
 #[derive(Config, Debug)]
 pub struct Interpolate2dConfig {
     /// Output size of the interpolated tensor.
-    /// If specified, this takes precedence over `scale_factor`.
+    /// Exactly one of `output_size` or `scale_factor` must be set.
     #[config(default = "None")]
     pub output_size: Option<[usize; 2]>,
 
     /// Scale factor for resizing the input tensor.
-    /// This is used when `output_size` is not specified.
+    /// The output size is `floor(input_size * scale_factor)`.
+    /// Exactly one of `output_size` or `scale_factor` must be set.
     #[config(default = "None")]
     pub scale_factor: Option<[f32; 2]>,
 
@@ -31,11 +35,6 @@ pub struct Interpolate2dConfig {
     /// Determines how the output values are calculated.
     #[config(default = "InterpolateMode::Nearest")]
     pub mode: InterpolateMode,
-
-    /// If `true`, the input and output tensors are aligned by their corner pixels.
-    /// If `false`, half-pixel coordinate mapping is used instead.
-    #[config(default = true)]
-    pub align_corners: bool,
 }
 
 /// Interpolate module for resizing tensors with shape [N, C, H, W].
@@ -63,9 +62,6 @@ pub struct Interpolate2d {
     /// Interpolation mode used for resizing
     #[module(skip)]
     pub mode: InterpolateMode,
-
-    /// Whether to align corner pixels
-    pub align_corners: bool,
 }
 
 impl Interpolate2dConfig {
@@ -75,11 +71,31 @@ impl Interpolate2dConfig {
             output_size: self.output_size,
             scale_factor: self.scale_factor,
             mode: self.mode,
-            align_corners: self.align_corners,
         }
     }
 }
 impl Interpolate2d {
+    /// The options the interpolation runs with.
+    fn options(&self) -> InterpolateOptions {
+        let mut options = InterpolateOptions::new(self.mode.clone().into());
+        options.output_size = self.output_size;
+        options.scale_factor = self.scale_factor;
+        options
+    }
+
+    /// The floor for an interpolation alone: a resampling to the size it produces. Each output
+    /// element blends a few neighbours, below this model's resolution, and reads at least one
+    /// position of its own along each dimension a downsampling shrinks.
+    fn bounds(&self, input: &Tensor<4>) -> Bounds {
+        let input_size = bounds::spatial(input);
+        let output_size = interpolate_output_size(input_size, &self.options());
+        Windowing {
+            output_size,
+            read_size: core::array::from_fn(|i| input_size[i].min(output_size[i])),
+        }
+        .resampling(input)
+    }
+
     /// Performs the forward pass of the interpolation module
     ///
     /// # Arguments
@@ -91,6 +107,10 @@ impl Interpolate2d {
     /// Resized tensor with shape [N, C, H', W'], where H' and W' are determined by
     /// the output_size or scale_factor specified in the module configuration
     ///
+    /// # Panics
+    ///
+    /// Panics unless exactly one of `output_size` or `scale_factor` is set.
+    ///
     /// # Example
     ///
     /// ```ignore
@@ -101,62 +121,9 @@ impl Interpolate2d {
     /// let output = interpolate.forward(input);
     /// assert_eq!(output.dims(), [1, 3, 128, 128]);
     /// ```
+    #[compute(bounds = Self::bounds)]
     pub fn forward(&self, input: Tensor<4>) -> Tensor<4> {
-        let output_size = calculate_output_size(input.dims(), self.output_size, self.scale_factor);
-        interpolate(
-            input,
-            output_size,
-            InterpolateOptions::new(self.mode.clone().into())
-                .with_align_corners(self.align_corners),
-        )
-    }
-}
-
-/// Calculates the output size for tensor interpolation.
-///
-/// # Arguments
-///
-/// * `input_dims` - The dimensions of the input tensor [N, C, H, W].
-/// * `output_size` - Optional desired output size [H', W'].
-/// * `scale_factor` - Optional scale factor for height and width [scale_h, scale_w].
-///
-/// # Returns
-///
-/// A tuple [H', W'] representing the calculated output size.
-///
-/// # Panics
-///
-/// Panics if neither `output_size` nor `scale_factor` is provided,
-/// or if the scale factor results in dimensions exceeding usize::MAX.
-fn calculate_output_size(
-    input_dims: [usize; 4],
-    output_size: Option<[usize; 2]>,
-    scale_factor: Option<[f32; 2]>,
-) -> [usize; 2] {
-    match (output_size, scale_factor) {
-        (Some(output_size), None) => {
-            // Use provided
-            output_size
-        }
-        (None, Some(scale_factor)) => {
-            // Calculate output size based on scale factor
-            let [_, _, h, w] = input_dims;
-
-            let new_dim_h = (h as f64) * (scale_factor[0] as f64);
-
-            if new_dim_h > usize::MAX as f64 {
-                panic!("Scale factor for height is too large");
-            }
-
-            let new_dim_w = (w as f64) * (scale_factor[1] as f64);
-
-            if new_dim_w > usize::MAX as f64 {
-                panic!("Scale factor for width is too large");
-            }
-
-            [new_dim_h as usize, new_dim_w as usize]
-        }
-        _ => panic!("Either output_size or scale_factor must be provided"),
+        interpolate(input, self.options())
     }
 }
 
@@ -180,41 +147,7 @@ mod tests {
     use burn::tensor::Distribution;
 
     use super::*;
-
-    #[test]
-    fn test_calculate_output_size() {
-        let input_dims = [1, 1, 4, 4];
-
-        let output_size = calculate_output_size(input_dims, Some([2, 2]), None);
-        assert_eq!(output_size, [2, 2]);
-
-        let output_size = calculate_output_size(input_dims, None, Some([2.0, 2.0]));
-        assert_eq!(output_size, [8, 8]);
-
-        let output_size = calculate_output_size([1, 1, 4, 4], None, Some([0.5, 0.5]));
-        assert_eq!(output_size, [2, 2]);
-
-        let output_size = calculate_output_size([1, 1, 4, 4], None, Some([2.0, 1.5]));
-        assert_eq!(output_size, [8, 6]);
-    }
-
-    #[test]
-    #[should_panic(expected = "Either output_size or scale_factor must be provided")]
-    fn test_missing_params() {
-        calculate_output_size([1, 1, 4, 4], None, None);
-    }
-
-    #[test]
-    #[should_panic(expected = "Scale factor for height is too large")]
-    fn test_infinite_height() {
-        calculate_output_size([1, 1, usize::MAX - 1, 4], None, Some([2.0, 1.0]));
-    }
-
-    #[test]
-    #[should_panic(expected = "Scale factor for width is too large")]
-    fn test_infinite_width() {
-        calculate_output_size([1, 1, 4, usize::MAX - 1], None, Some([1.0, 2.0]));
-    }
+    use burn::tensor::ops::CoordinateTransformMode;
 
     #[test]
     fn test_module() {
@@ -230,19 +163,54 @@ mod tests {
         let output = interpolate.forward(input.clone());
         assert_eq!(output.dims(), [2, 3, 8, 8]);
 
-        // Test with scale_factor
-        let config = Interpolate2dConfig::new().with_scale_factor(Some([0.5, 0.5]));
+        // Test with scale_factor on a non-square input to catch swapped axes
+        let non_square = Tensor::<4>::random(
+            [2, 3, 4, 6],
+            Distribution::Uniform(0.0, 1.0),
+            &Default::default(),
+        );
+        let config = Interpolate2dConfig::new().with_scale_factor(Some([0.5, 2.0]));
         let interpolate = config.init();
-        let output = interpolate.forward(input.clone());
-        assert_eq!(output.dims(), [2, 3, 2, 2]);
+        let output = interpolate.forward(non_square);
+        assert_eq!(output.dims(), [2, 3, 2, 12]);
 
         // Test with different interpolation mode
         let config = Interpolate2dConfig::new()
             .with_output_size(Some([6, 6]))
-            .with_mode(InterpolateMode::Linear);
+            .with_mode(InterpolateMode::Linear {
+                coordinate_transform: CoordinateTransformMode::AlignCorners,
+            });
         let interpolate = config.init();
         let output = interpolate.forward(input);
         assert_eq!(output.dims(), [2, 3, 6, 6]);
+    }
+
+    #[test]
+    fn test_nearest_default_mapping() {
+        let input = Tensor::<4>::from_floats([[[[10.0, 20.0, 30.0, 40.0]]]], &Default::default());
+        let config = Interpolate2dConfig::new().with_output_size(Some([1, 2]));
+        let interpolate = config.init();
+        let output = interpolate.forward(input);
+        assert_eq!(output.into_data().as_slice::<f32>().unwrap(), &[10.0, 30.0]);
+    }
+
+    #[test]
+    fn linear_coordinate_transform() {
+        let input = Tensor::<4>::from_floats([[[[0.0, 6.0], [12.0, 18.0]]]], &Default::default());
+        let output = Interpolate2dConfig::new()
+            .with_mode(InterpolateMode::Linear {
+                coordinate_transform: CoordinateTransformMode::HalfPixel,
+            })
+            .with_output_size(Some([4, 4]))
+            .init()
+            .forward(input);
+        let expected = burn::tensor::TensorData::from([[[
+            [0.0, 1.5, 4.5, 6.0],
+            [3.0, 4.5, 7.5, 9.0],
+            [9.0, 10.5, 13.5, 15.0],
+            [12.0, 13.5, 16.5, 18.0],
+        ]]]);
+        output.into_data().assert_eq(&expected, false);
     }
 
     #[test]

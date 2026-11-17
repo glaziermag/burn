@@ -1,4 +1,5 @@
 use self::unary_basic_int::BasicIntUnaryKind;
+use burn_backend::RandomKey;
 use burn_backend::cubecl::dtype_to_storage_type;
 
 use super::{expand, numeric, permute, unfold};
@@ -16,7 +17,9 @@ use crate::{
 };
 use burn_backend::tensor::{BoolTensor, Device, FloatTensor, IntTensor};
 use burn_backend::{DType, IntDType, Slice, ops::IntTensorOps};
-use burn_backend::{Distribution, ElementConversion, Shape, TensorData, get_device_settings};
+use burn_backend::{
+    Distribution, ElementConversion, Shape, TensorData, get_or_init_device_settings,
+};
 use burn_backend::{ExecutionError, Scalar};
 use burn_std::{BoolDType, FloatDType};
 use cubecl::frontend::Numeric;
@@ -35,7 +38,7 @@ impl IntTensorOps<Self> for CubeBackend {
     }
 
     fn int_from_data(data: TensorData, device: &Device<Self>) -> IntTensor<Self> {
-        match data.dtype {
+        match data.dtype() {
             DType::I64
             | DType::I32
             | DType::I16
@@ -663,16 +666,19 @@ impl IntTensorOps<Self> for CubeBackend {
         distribution: Distribution,
         device: &Device<Self>,
         dtype: IntDType,
+        key: RandomKey,
     ) -> IntTensor<Self> {
         let dtype = dtype.into();
         match distribution {
-            Distribution::Default => random_uniform(shape, device, 0., 255., dtype),
+            Distribution::Default => random_uniform(shape, device, 0., 255., dtype, key),
             Distribution::Uniform(low, high) => {
-                random_uniform(shape, device, low.elem(), high.elem(), dtype)
+                random_uniform(shape, device, low.elem(), high.elem(), dtype, key)
             }
-            Distribution::Bernoulli(prob) => random_bernoulli(shape, device, prob as f32, dtype),
+            Distribution::Bernoulli(prob) => {
+                random_bernoulli(shape, device, prob as f32, dtype, key)
+            }
             Distribution::Normal(mean, std) => {
-                random_normal(shape, device, mean.elem(), std.elem(), dtype)
+                random_normal(shape, device, mean.elem(), std.elem(), dtype, key)
             }
         }
     }
@@ -686,7 +692,7 @@ impl IntTensorOps<Self> for CubeBackend {
     }
 
     fn int_flip(tensor: IntTensor<Self>, axes: &[usize]) -> IntTensor<Self> {
-        let bool_dtype = get_device_settings::<Self>(&tensor.device).bool_dtype;
+        let bool_dtype = get_or_init_device_settings::<Self>(&tensor.device).bool_dtype;
         kernel::flip(tensor, axes, bool_dtype.into())
     }
 

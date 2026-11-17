@@ -69,14 +69,13 @@ pub fn lora_finetuning<D: TextClassificationDataset + 'static>(
 
     // Initialize learner
     let training = SupervisedTraining::new(artifact_dir, dataloader_train, dataloader_test)
-        .metric_train(CudaMetric::new())
-        .metric_valid(CudaMetric::new())
+        .metrics_text(CudaMetric::new())
         .metric_train(IterationSpeedMetric::new())
-        .metric_train_numeric(LossMetric::new())
-        .metric_valid_numeric(LossMetric::new())
-        .metric_train_numeric(AccuracyMetric::new())
-        .metric_valid_numeric(AccuracyMetric::new())
-        .metric_train_numeric(LearningRateMetric::new())
+        .metrics((
+            LossMetric::new(),
+            AccuracyMetric::new(),
+            LearningRateMetric::new(),
+        ))
         .with_default_checkpointers()
         .with_training_strategy(strategy.into())
         .num_epochs(config.num_epochs)
@@ -85,10 +84,11 @@ pub fn lora_finetuning<D: TextClassificationDataset + 'static>(
     // Train the model
     let result = training.launch(Learner::new(model, optim, lr_scheduler));
 
-    // Save the configuration and the trained model
+    // Merge adapters so inference can load the record into a model without adapters.
     config.save(format!("{artifact_dir}/config.json")).unwrap();
     result
         .model
+        .materialize()
         .into_record()
         .save(format!("{artifact_dir}/model"))
         .unwrap();

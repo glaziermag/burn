@@ -156,6 +156,9 @@ macro_rules! module {
 /// Training and validation use the same module type. This trait provides state transitions,
 /// not a guarantee that a value currently has autodiff enabled. Inspect individual parameter
 /// tensors with [`Tensor::is_autodiff`] and [`Tensor::is_require_grad`]; contexts can be mixed.
+#[diagnostic::on_unimplemented(
+    note = "If `{Self}` is used as configuration or runtime state in a `#[derive(Module)]` type, mark that field with `#[module(skip)]`."
+)]
 pub trait Module: Clone + Send + core::fmt::Debug {
     /// Return all the devices found in the underneath module tree added to the given vector
     /// without duplicates.
@@ -369,7 +372,8 @@ pub trait Module: Clone + Send + core::fmt::Debug {
     /// method applies.
     ///
     /// Tensor-bearing modules require the `autodiff` feature to enable autodiff. This does not
-    /// undo explicit freezing or reconstruct state discarded by [`valid`](Module::valid).
+    /// undo explicit freezing or restore tensor checkpointing strategies discarded by
+    /// [`valid`](Module::valid).
     fn train(self) -> Self;
 
     /// Returns a validation snapshot without autodiff or active training flags.
@@ -383,12 +387,31 @@ pub trait Module: Clone + Send + core::fmt::Debug {
     /// a plain device still disables its training flags, so the operation is idempotent but not
     /// necessarily a structural no-op.
     ///
-    /// The returned value is an inference snapshot: parameter reparameterizations are folded into
-    /// their values, and tensor checkpointing strategies are removed with autodiff. Calling
-    /// [`Module::train`] on that snapshot does not reconstruct those reparameterizations or restore
-    /// the previous checkpointing strategies. Keep the original module when continuing training
-    /// after validation.
+    /// Parameter reparameterizations and their stored bases are preserved, including quantized
+    /// bases. Their nested modules are also put into validation mode. Use
+    /// [`materialize`](Module::materialize) explicitly to fold reparameterizations into weights.
+    /// Tensor checkpointing strategies are removed with autodiff and are not restored by
+    /// [`Module::train`]. Keep the original module when continuing training after validation.
     fn valid(&self) -> Self;
+
+    /// Fold parameter reparameterizations into their effective values and remove them.
+    ///
+    /// Each reparameterized parameter is replaced by the value computed from its stored base and
+    /// reparameterization state. Other parameters and module training flags are unchanged. The
+    /// resulting parameters retain their base parameter IDs, layout mappings and configured
+    /// trainability, but are detached from the computation that produced them.
+    /// Parameters without reparameterizations remain lazy; this does not initialize them.
+    ///
+    /// This consumes the module and cannot be undone on the returned value. Clone the module first
+    /// to retain its reparameterizations. To prepare merged inference weights, use
+    /// `model.valid().materialize()`; materialization alone does not switch to validation mode.
+    ///
+    /// # Memory and precision
+    ///
+    /// LoRA adapters are merged into dense weights. For QLoRA this also replaces the packed base
+    /// with a dense effective weight, which can substantially increase memory use. Requantization
+    /// must be requested separately and may change the model's outputs.
+    fn materialize(self) -> Self;
 
     /// Get the number of parameters the module has, including all of its sub-modules, without
     /// initializing the ones not initialized yet.
@@ -454,6 +477,9 @@ pub trait Module: Clone + Send + core::fmt::Debug {
     /// Apply QLoRA to the module: quantize the (frozen) base tensor parameters and attach trainable
     /// LoRA adapters to 2-D weights.
     ///
+    /// Dense effective weights can still materialize during training, even with fusion enabled.
+    /// See [`QLora`'s memory limitations](QLora#memory-limitations) before sizing a training run.
+    ///
     /// Module-owned control flags are preserved. Call [`freeze`](Module::freeze) before this
     /// method if the base module's control behavior and running statistics should also be frozen.
     fn apply_qlora(self, qlora: QLora) -> Self
@@ -476,7 +502,8 @@ pub trait Module: Clone + Send + core::fmt::Debug {
         crate::store::ModuleRecord::from_module(self, None)
     }
 
-    /// Collect the tensor parameters `group` names into a [`ModuleRecord`](crate::store::ModuleRecord).
+    /// Collect this module's tensor parameters matched by `group` into a
+    /// [`ModuleRecord`](crate::store::ModuleRecord).
     ///
     /// The record of a part of the module rather than all of it — what a run that trained a
     /// group writes when the rest of the module is the checkpoint it started from, and what
@@ -496,8 +523,10 @@ pub trait Module: Clone + Send + core::fmt::Debug {
     /// Apply a [`ModuleRecord`](crate::store::ModuleRecord) to this module, returning the loaded
     /// module.
     ///
-    /// Honors the record's [`DTypePolicy`](crate::store::DTypePolicy), `validate`, and
-    /// `allow_partial` settings.
+    /// Honors the record's [`DTypePolicy`](crate::store::DTypePolicy),
+    /// [`validate`](crate::store::ModuleRecord::validate),
+    /// [`allow_partial`](crate::store::ModuleRecord::allow_partial), and
+    /// [`allow_unused`](crate::store::ModuleRecord::allow_unused) settings.
     fn try_load_record(
         self,
         record: crate::store::ModuleRecord,
@@ -524,7 +553,8 @@ pub trait Module: Clone + Send + core::fmt::Debug {
     ///
     /// Convenience for [`into_record`](Module::into_record) followed by
     /// [`ModuleRecord::save`](crate::store::ModuleRecord::save). For non-default load behavior
-    /// (dtype policy, partial loading, validation), go through the record directly.
+    /// (dtype policy, partial loading, unused tensors, shape validation), go through the record
+    /// directly.
     #[cfg(feature = "std")]
     fn save_file<P: AsRef<std::path::Path>>(self, path: P) -> Result<(), crate::store::RecordError>
     where
@@ -537,8 +567,8 @@ pub trait Module: Clone + Send + core::fmt::Debug {
     ///
     /// Uses the default load behavior. Panics on I/O or validation errors; use
     /// [`try_load_file`](Module::try_load_file) for the fallible variant, or go through
-    /// [`ModuleRecord`](crate::store::ModuleRecord) to configure dtype policy, partial loading or
-    /// validation.
+    /// [`ModuleRecord`](crate::store::ModuleRecord) to configure dtype policy, partial loading,
+    /// unused tensors, or shape validation.
     #[cfg(feature = "std")]
     fn load_file<P: AsRef<std::path::Path>>(self, path: P) -> Self
     where
@@ -605,6 +635,8 @@ pub trait ModuleVisitor {
     /// - `container_type`: The type of the container with format:
     ///   - For user-defined structs: "Struct:TypeName" (e.g., "Struct:Linear")
     ///   - For user-defined enums: "Enum:TypeName" (e.g., "Enum:MyEnum")
+    ///   - For named enum variant fields: "Variant:TypeName::VariantName"
+    ///     (e.g., "Variant:MyEnum::Wide")
     ///   - For Vec containers: "Vec" (name is the index)
     ///   - For Tuple containers: "Tuple" (name is the index)
     ///   - For Array containers: "Array" (name is the index)
@@ -621,6 +653,8 @@ pub trait ModuleVisitor {
     /// - `container_type`: The type of the container with format:
     ///   - For user-defined structs: "Struct:TypeName" (e.g., "Struct:Linear")
     ///   - For user-defined enums: "Enum:TypeName" (e.g., "Enum:MyEnum")
+    ///   - For named enum variant fields: "Variant:TypeName::VariantName"
+    ///     (e.g., "Variant:MyEnum::Wide")
     ///   - For Vec containers: "Vec" (name is the index)
     ///   - For Tuple containers: "Tuple" (name is the index)
     ///   - For Array containers: "Array" (name is the index)
@@ -691,6 +725,8 @@ pub trait ModuleMapper {
     /// - `container_type`: The type of the container with format:
     ///   - For user-defined structs: "Struct:TypeName" (e.g., "Struct:Linear")
     ///   - For user-defined enums: "Enum:TypeName" (e.g., "Enum:MyEnum")
+    ///   - For named enum variant fields: "Variant:TypeName::VariantName"
+    ///     (e.g., "Variant:MyEnum::Wide")
     ///   - For Vec containers: "Vec" (name is the index)
     ///   - For Tuple containers: "Tuple" (name is the index)
     ///   - For Array containers: "Array" (name is the index)
@@ -707,6 +743,8 @@ pub trait ModuleMapper {
     /// - `container_type`: The type of the container with format:
     ///   - For user-defined structs: "Struct:TypeName" (e.g., "Struct:Linear")
     ///   - For user-defined enums: "Enum:TypeName" (e.g., "Enum:MyEnum")
+    ///   - For named enum variant fields: "Variant:TypeName::VariantName"
+    ///     (e.g., "Variant:MyEnum::Wide")
     ///   - For Vec containers: "Vec" (name is the index)
     ///   - For Tuple containers: "Tuple" (name is the index)
     ///   - For Array containers: "Array" (name is the index)

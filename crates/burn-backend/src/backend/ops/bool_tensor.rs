@@ -2,10 +2,10 @@ use super::{
     argwhere::argwhere_data, cat::cat_with_slice_assign, repeat_dim::repeat_with_slice_assign,
 };
 use crate::tensor::{BoolTensor, Device, FloatTensor, IntTensor};
-use crate::{Backend, TensorData, TensorMetadata, get_device_settings};
+use crate::{Backend, TensorData, TensorMetadata, get_or_init_device_settings};
 use crate::{ExecutionError, Scalar};
 use alloc::vec::Vec;
-use burn_std::{BoolDType, FloatDType, IntDType, Shape, Slice};
+use burn_std::{BoolDType, FloatDType, IndexingUpdateOp, IntDType, Shape, Slice};
 use core::future::Future;
 
 /// Bool Tensor API for basic operations, see
@@ -101,8 +101,16 @@ pub trait BoolTensorOps<B: Backend> {
     /// The float tensor with the same data as the bool tensor.
     fn bool_into_float(tensor: BoolTensor<B>, out_dtype: FloatDType) -> FloatTensor<B>;
 
-    /// Moves the tensor to the device.
-    fn bool_to_device(tensor: BoolTensor<B>, device: &Device<B>) -> BoolTensor<B>;
+    /// Moves the tensor to the device using the requested boolean storage.
+    ///
+    /// Preserves boolean values and shape. The returned tensor's dtype is `out_dtype`, which
+    /// must be supported by the destination device. Conversion can run on either device,
+    /// depending on which supports both the source and destination storage representations.
+    fn bool_to_device(
+        tensor: BoolTensor<B>,
+        device: &Device<B>,
+        out_dtype: BoolDType,
+    ) -> BoolTensor<B>;
 
     /// Reshapes the tensor.
     ///
@@ -209,7 +217,7 @@ pub trait BoolTensorOps<B: Backend> {
             // Data-dependent output length, so we defer to `bool_argwhere` (the only pre-existing
             // data-dependent op) to collect the flat indices of the true mask values, then select.
             let n = mask.shape().num_elements();
-            let int_dtype = get_device_settings::<B>(&mask.device()).int_dtype;
+            let int_dtype = get_or_init_device_settings::<B>(&mask.device()).int_dtype;
             let mask = B::bool_reshape(mask, Shape::new([n]));
             let indices = B::bool_argwhere(mask, int_dtype).await; // [count, 1]
             let count = indices.shape()[0];
@@ -228,7 +236,10 @@ pub trait BoolTensorOps<B: Backend> {
     /// * `indices` - The indices.
     fn bool_gather(dim: usize, tensor: BoolTensor<B>, indices: IntTensor<B>) -> BoolTensor<B>;
 
-    /// Scatter a given value to the tensor at the given indices using boolean or reduction.
+    /// Scatter elements into a tensor using the specified update operation.
+    ///
+    /// `Assign` overwrites, `Add` and `Max` combine with logical or, and `Mul` and `Min`
+    /// combine with logical and.
     ///
     /// # Arguments
     ///
@@ -236,16 +247,32 @@ pub trait BoolTensorOps<B: Backend> {
     /// * `tensor` - The tensor.
     /// * `indices` - The indices.
     /// * `value` - The value.
+    /// * `update` - The update operation.
     ///
     /// # Returns
     ///
     /// The tensor with the values scattered.
-    fn bool_scatter_or(
+    fn bool_scatter(
         dim: usize,
         tensor: BoolTensor<B>,
         indices: IntTensor<B>,
         value: BoolTensor<B>,
+        update: IndexingUpdateOp,
     ) -> BoolTensor<B>;
+
+    /// Multi-dimensional scatter for bool tensors.
+    ///
+    /// `Assign` overwrites, `Add` and `Max` combine with logical or, and `Mul` and `Min`
+    /// combine with logical and.
+    fn bool_scatter_nd(
+        data: BoolTensor<B>,
+        indices: IntTensor<B>,
+        values: BoolTensor<B>,
+        reduction: IndexingUpdateOp,
+    ) -> BoolTensor<B>;
+
+    /// Multi-dimensional gather for bool tensors.
+    fn bool_gather_nd(data: BoolTensor<B>, indices: IntTensor<B>) -> BoolTensor<B>;
 
     /// Select tensor elements along the given dimension corresponding to the given indices.
     ///
@@ -260,8 +287,10 @@ pub trait BoolTensorOps<B: Backend> {
     /// The tensor with the selected elements.
     fn bool_select(tensor: BoolTensor<B>, dim: usize, indices: IntTensor<B>) -> BoolTensor<B>;
 
-    /// Assign the selected elements along the given dimension corresponding to the given indices
-    /// to the given value using sum reduction.
+    /// Assign selected elements along a dimension using the specified update operation.
+    ///
+    /// `Assign` overwrites, `Add` and `Max` combine with logical or, and `Mul` and `Min`
+    /// combine with logical and.
     ///
     /// # Arguments
     ///
@@ -269,15 +298,17 @@ pub trait BoolTensorOps<B: Backend> {
     /// * `dim` - The dimension to select from.
     /// * `indices` - The indices of the elements to assign.
     /// * `value` - The values to assign.
+    /// * `update` - The update operation.
     ///
     /// # Returns
     ///
     /// The tensor with the assigned values.
-    fn bool_select_or(
+    fn bool_select_assign(
         tensor: BoolTensor<B>,
         dim: usize,
         indices: IntTensor<B>,
         value: BoolTensor<B>,
+        update: IndexingUpdateOp,
     ) -> BoolTensor<B>;
 
     /// Repeats one dimension of the tensor a given number of times along that dimension.
@@ -493,7 +524,7 @@ pub trait BoolTensorOps<B: Backend> {
     /// A boolean tensor with a single element, True if any element in the tensor is True, False otherwise.
     fn bool_any(tensor: BoolTensor<B>) -> BoolTensor<B> {
         let dtype = tensor.dtype();
-        let int_dtype = get_device_settings::<B>(&tensor.device()).int_dtype;
+        let int_dtype = get_or_init_device_settings::<B>(&tensor.device()).int_dtype;
         let sum = B::int_sum(B::bool_into_int(tensor, int_dtype));
         B::int_greater_elem(sum, 0.into(), dtype.into())
     }
@@ -512,7 +543,7 @@ pub trait BoolTensorOps<B: Backend> {
     /// evaluates to True, False otherwise.
     fn bool_any_dim(tensor: BoolTensor<B>, dim: usize) -> BoolTensor<B> {
         let dtype = tensor.dtype();
-        let int_dtype = get_device_settings::<B>(&tensor.device()).int_dtype;
+        let int_dtype = get_or_init_device_settings::<B>(&tensor.device()).int_dtype;
         let sum = B::int_sum_dim(B::bool_into_int(tensor, int_dtype), dim);
         B::int_greater_elem(sum, 0.into(), dtype.into())
     }
@@ -529,7 +560,7 @@ pub trait BoolTensorOps<B: Backend> {
     /// evaluate to True, False otherwise.
     fn bool_all(tensor: BoolTensor<B>) -> BoolTensor<B> {
         let dtype = tensor.dtype();
-        let int_dtype = get_device_settings::<B>(&tensor.device()).int_dtype;
+        let int_dtype = get_or_init_device_settings::<B>(&tensor.device()).int_dtype;
         let num_elems = tensor.shape().num_elements() as i64;
         let sum = B::int_sum(B::bool_into_int(tensor, int_dtype));
         B::int_equal_elem(sum, num_elems.into(), dtype.into())
@@ -549,7 +580,7 @@ pub trait BoolTensorOps<B: Backend> {
     /// evaluates to True, False otherwise.
     fn bool_all_dim(tensor: BoolTensor<B>, dim: usize) -> BoolTensor<B> {
         let dtype = tensor.dtype();
-        let int_dtype = get_device_settings::<B>(&tensor.device()).int_dtype;
+        let int_dtype = get_or_init_device_settings::<B>(&tensor.device()).int_dtype;
         let num_elems = tensor.shape()[dim] as i64;
         let sum = B::int_sum_dim(B::bool_into_int(tensor, int_dtype), dim);
         B::int_equal_elem(sum, num_elems.into(), dtype.into())

@@ -1,8 +1,10 @@
-use alloc::string::String;
-use burn_backend::{DType, Shape, backend::DeviceOps};
+use alloc::{string::String, vec::Vec};
+use burn_backend::{
+    DType, Shape, backend::DeviceOps, distributed::ReduceOperation, ops::EmulatedCollectives,
+};
 use burn_ir::TensorIr;
 
-use crate::{MultiBackendBridge, RouterClient, RouterTensor, get_client};
+use crate::{BackendRouter, MultiBackendBridge, RouterClient, RouterTensor, get_client};
 
 /// Type alias for `<Br as MultiBackendBridge>::TensorHandle`.
 pub type TensorHandle<Br> = <Br as MultiBackendBridge>::TensorHandle;
@@ -38,10 +40,13 @@ pub trait RouterChannel: Clone + Send + Sync + 'static + Sized {
         dtype: DType,
     ) -> RouterTensor<Self::Client>;
 
-    /// Change the tensor to a different client backend.
+    /// Change the tensor to a different client backend using the requested dtype.
+    ///
+    /// Boolean storage may change; numeric dtypes must match the source tensor.
     fn change_client_backend(
         tensor: RouterTensor<Self::Client>,
         device: &Self::Device, // target device
+        dtype: DType,
     ) -> RouterTensor<Self::Client> {
         // Get tensor handle from current client
         let original_client = tensor.client.clone();
@@ -50,16 +55,28 @@ pub trait RouterChannel: Clone + Send + Sync + 'static + Sized {
 
         if desc.dtype.is_float() {
             handle = Self::Bridge::change_backend_float(handle, desc.shape.clone(), device);
-        } else if desc.dtype.is_int() {
+        } else if desc.dtype.is_int() || desc.dtype.is_uint() {
             handle = Self::Bridge::change_backend_int(handle, desc.shape.clone(), device);
         } else if desc.dtype.is_bool() {
-            handle = Self::Bridge::change_backend_bool(handle, desc.shape.clone(), device);
+            handle =
+                Self::Bridge::change_backend_bool(handle, desc.shape.clone(), device, dtype.into());
+        } else if matches!(desc.dtype, DType::QFloat(_)) {
+            handle = Self::Bridge::change_backend_quantized(handle, desc.shape.clone(), device);
         } else {
-            unimplemented!()
+            unimplemented!("moving a {:?} tensor to another router client", desc.dtype)
         }
 
         // Register tensor handle on target client
         let target_client = get_client::<Self>(device);
-        Self::register_tensor(&target_client, handle, desc.shape, desc.dtype)
+        Self::register_tensor(&target_client, handle, desc.shape, dtype)
+    }
+
+    /// Every member's [all-reduce](burn_backend::ops::CollectiveOps::float_all_reduce), emulated
+    /// with transfers unless the channel runs it where the members live.
+    fn float_all_reduce(
+        tensors: Vec<RouterTensor<Self::Client>>,
+        op: ReduceOperation,
+    ) -> Vec<RouterTensor<Self::Client>> {
+        EmulatedCollectives::<BackendRouter<Self>>::float_all_reduce(tensors, op)
     }
 }

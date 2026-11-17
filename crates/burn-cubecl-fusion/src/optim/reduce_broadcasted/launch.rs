@@ -1,20 +1,24 @@
+use crate::engine::codegen::ir::FuseArg;
+#[cfg(feature = "autotune")]
 use crate::{
     engine::{
-        codegen::ir::{FuseArg, FuseBlockConfig, GlobalArgsLaunch, RefLayout},
+        codegen::ir::{FuseBlockConfig, GlobalArgsLaunch, RefLayout},
         launch::runner::{TraceRunner, Vectorization},
     },
     optim::reduce_broadcasted::unit::{
         ElemwiseFuseBlockLaunch, ReduceFuseBlockLaunch, reduce_kernel_broadcasted,
     },
 };
+#[cfg(feature = "autotune")]
 use cubecl::{
     ir::{ElemType, FloatKind},
     prelude::*,
     server::LaunchError,
 };
+use cubek::reduce::components::instructions::ReduceOperationConfig;
+#[cfg(feature = "autotune")]
 use cubek::reduce::{
     ReduceDtypes, VectorizationMode,
-    components::instructions::ReduceOperationConfig,
     launch::RoutineStrategy,
     output_vectorization_axis,
     routines::{
@@ -31,6 +35,7 @@ pub struct ReduceBroadcastedFuseBlock {
     pub(crate) output: FuseArg,
 }
 
+#[cfg(feature = "autotune")]
 #[derive(new)]
 pub struct FusedReduceBroadcastedLaunch<'a> {
     blocks: &'a Vec<ReduceBroadcastedFuseBlock>,
@@ -39,8 +44,10 @@ pub struct FusedReduceBroadcastedLaunch<'a> {
     _strategy: RoutineStrategy,
 }
 
+#[cfg(feature = "autotune")]
 impl Vectorization for FusedReduceBroadcastedLaunch<'_> {}
 
+#[cfg(feature = "autotune")]
 impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
     type Error = LaunchError;
 
@@ -54,12 +61,14 @@ impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
         let routine = UnitRoutine;
         let first_config = &configs[0];
 
-        let shape = match &first_config.ref_layout {
-            RefLayout::Concrete(FuseArg::Output(..)) => {
-                outputs.shape_ref(&first_config.ref_layout, first_config.rank)
-            }
-            _ => inputs.shape_ref(&first_config.ref_layout, first_config.rank),
+        // An output-concrete reference indexes the output arguments; shape and
+        // strides must both be resolved against that list.
+        let ref_args = match &first_config.ref_layout {
+            RefLayout::Concrete(FuseArg::Output(..)) => &outputs,
+            _ => &inputs,
         };
+        let shape = ref_args.shape_ref(&first_config.ref_layout, first_config.rank);
+        let ref_strides = ref_args.strides_ref(&first_config.ref_layout, first_config.rank);
 
         let reduce_len = shape[self.reduce_axis];
         let reduce_count = shape.iter().product::<usize>() / reduce_len;
@@ -126,11 +135,8 @@ impl TraceRunner for FusedReduceBroadcastedLaunch<'_> {
             false => ComptimeOptionArgs::None,
         };
 
-        let out_vec_axis = output_vectorization_axis(
-            &inputs.strides_ref(&first_config.ref_layout, first_config.rank),
-            self.reduce_axis,
-            VectorizationMode::Parallel,
-        );
+        let out_vec_axis =
+            output_vectorization_axis(&ref_strides, self.reduce_axis, VectorizationMode::Parallel);
 
         // TODO: Ensure parallel is selected.
 

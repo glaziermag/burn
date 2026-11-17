@@ -1,5 +1,5 @@
 use crate::tensor::FloatTensor;
-use crate::{Backend, Scalar, TensorMetadata, get_device_settings};
+use crate::{Backend, Scalar, TensorMetadata, get_or_init_device_settings};
 use core::f64::consts::SQRT_2;
 
 /// Activation function operations.
@@ -17,7 +17,7 @@ pub trait ActivationOps<B: Backend> {
     ///
     /// The output tensor.
     fn leaky_relu(tensor: FloatTensor<B>, negative_slope: Scalar) -> FloatTensor<B> {
-        let bool_dtype = get_device_settings::<B>(&tensor.device()).bool_dtype;
+        let bool_dtype = get_or_init_device_settings::<B>(&tensor.device()).bool_dtype;
         let mask = B::float_lower_elem(tensor.clone(), 0f32.into(), bool_dtype);
         let scaled_tensor = B::float_mul_scalar(tensor.clone(), negative_slope);
 
@@ -35,7 +35,7 @@ pub trait ActivationOps<B: Backend> {
     ///
     /// The output tensor.
     fn relu(tensor: FloatTensor<B>) -> FloatTensor<B> {
-        let bool_dtype = get_device_settings::<B>(&tensor.device()).bool_dtype;
+        let bool_dtype = get_or_init_device_settings::<B>(&tensor.device()).bool_dtype;
         let mask = B::float_lower_equal_elem(tensor.clone(), 0f32.into(), bool_dtype);
 
         B::float_mask_fill(tensor, mask, 0f32.into())
@@ -51,7 +51,7 @@ pub trait ActivationOps<B: Backend> {
     ///
     /// The gradient.
     fn relu_backward(output: FloatTensor<B>, grad: FloatTensor<B>) -> FloatTensor<B> {
-        let bool_dtype = get_device_settings::<B>(&output.device()).bool_dtype;
+        let bool_dtype = get_or_init_device_settings::<B>(&output.device()).bool_dtype;
         let mask = B::float_lower_equal_elem(output, 0f32.into(), bool_dtype);
 
         B::float_mask_fill(grad, mask, 0.into())
@@ -79,7 +79,7 @@ pub trait ActivationOps<B: Backend> {
     /// * `tensor` - The input tensor
     /// * `alpha` - The weight tensor
     fn prelu(tensor: FloatTensor<B>, alpha: FloatTensor<B>) -> FloatTensor<B> {
-        let bool_dtype = get_device_settings::<B>(&tensor.device()).bool_dtype;
+        let bool_dtype = get_or_init_device_settings::<B>(&tensor.device()).bool_dtype;
         let mask = B::float_lower_elem(tensor.clone(), 0f32.into(), bool_dtype);
         let scaled_tensor = B::float_mul(tensor.clone(), alpha);
         B::float_mask_where(tensor, mask, scaled_tensor)
@@ -96,35 +96,20 @@ pub trait ActivationOps<B: Backend> {
     ///
     /// The output tensor.
     fn gelu_backward(x: FloatTensor<B>, grad: FloatTensor<B>) -> FloatTensor<B> {
-        // Derivative of the approximate gelu implementation based on tanh.
+        // Exact analytical derivative of erf-based GELU:
+        // d/dx [0.5 * x * (1 + erf(x / sqrt(2)))]
+        // = 0.5 * (1 + erf(x / sqrt(2))) + x * (1 / sqrt(2 * pi)) * exp(-0.5 * x^2)
+        const FRAC_1_SQRT_2PI: f64 = 0.3989422804014327;
 
-        let constant_1 = 0.0356774;
-        let constant_2 = 0.797885;
-        let constant_3 = 0.0535161;
-        let constant_4 = 0.398942;
+        let erf_term = B::float_erf(B::float_div_scalar(x.clone(), SQRT_2.into()));
+        let cdf = B::float_mul_scalar(B::float_add_scalar(erf_term, 1.0.into()), 0.5.into());
 
-        let x3 = B::float_powi_scalar(x.clone(), 3.into());
+        let x2 = B::float_mul(x.clone(), x.clone());
+        let exp_term = B::float_exp(B::float_mul_scalar(x2, (-0.5).into()));
+        let pdf_term = B::float_mul(B::float_mul_scalar(x, FRAC_1_SQRT_2PI.into()), exp_term);
 
-        let c1 = B::float_mul_scalar(x3.clone(), constant_1.into());
-        let c2 = B::float_mul_scalar(x.clone(), constant_2.into());
-        let c3 = B::float_mul_scalar(x3, constant_3.into());
-        let c4 = B::float_mul_scalar(x, constant_4.into());
-
-        let inner1 = B::float_add(c1, c2);
-        let inner2 = B::float_add(c3, c4);
-
-        let tanh = B::float_tanh(inner1);
-
-        let sech = B::float_powi_scalar(tanh.clone(), 2.into());
-        let sech = B::float_neg(sech);
-        let sech = B::float_add_scalar(sech, 1.into());
-
-        let y1 = B::float_mul_scalar(tanh, 0.5.into());
-        let y2 = B::float_mul(inner2, sech);
-        let y2 = B::float_add_scalar(y2, 0.5.into());
-        let y = B::float_add(y1, y2);
-
-        B::float_mul(y, grad)
+        let dgelu = B::float_add(cdf, pdf_term);
+        B::float_mul(dgelu, grad)
     }
 
     /// Applies the Sigmoid activation function.
@@ -217,7 +202,7 @@ pub trait ActivationOps<B: Backend> {
         // This extends the range of values for which we obtain accurate results.
 
         // max(-x, 0)
-        let bool_dtype = get_device_settings::<B>(&tensor.device()).bool_dtype;
+        let bool_dtype = get_or_init_device_settings::<B>(&tensor.device()).bool_dtype;
         let tensor_neg = B::float_neg(tensor);
         let mask = B::float_lower_elem(tensor_neg.clone(), 0f32.into(), bool_dtype);
         let max_elem = B::float_mask_fill(tensor_neg.clone(), mask, 0f32.into());
@@ -313,7 +298,7 @@ pub trait ActivationOps<B: Backend> {
         let shape = x.shape();
         let dtype = x.dtype();
         let device = x.device();
-        let bool_dtype = get_device_settings::<B>(&device).bool_dtype;
+        let bool_dtype = get_or_init_device_settings::<B>(&device).bool_dtype;
 
         // max(-x, 0)
         let x_neg = B::float_neg(x);

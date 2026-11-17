@@ -5,12 +5,12 @@ use crate::{
     tensor::CubeTensor,
 };
 use burn_backend::cubecl::dtype_to_storage_type;
+use burn_backend::{Backend, Scalar, Shape, TensorData};
 use burn_backend::{
     ExecutionError, Slice,
     ops::BoolTensorOps,
-    tensor::{BoolTensor, Device, FloatTensor, IntTensor},
+    tensor::{BoolTensor, Device, FloatTensor, IndexingUpdateOp, IntTensor},
 };
-use burn_backend::{Scalar, Shape, TensorData};
 use burn_std::{BoolDType, BoolStore, DType, FloatDType, IntDType};
 use cubecl::prelude::InputScalar;
 use cubek::reduce::components::instructions::ReduceOperationConfig;
@@ -46,10 +46,10 @@ impl BoolTensorOps<Self> for CubeBackend {
 
     fn bool_from_data(data: TensorData, device: &Device<Self>) -> BoolTensor<Self> {
         if !matches!(
-            data.dtype,
+            data.dtype(),
             DType::Bool(BoolStore::U8) | DType::Bool(BoolStore::U32)
         ) {
-            unimplemented!("Unsupported dtype for `bool_from_data` {:?}", data.dtype);
+            unimplemented!("Unsupported dtype for `bool_from_data` {:?}", data.dtype());
         }
         super::from_data(data, device)
     }
@@ -58,8 +58,24 @@ impl BoolTensorOps<Self> for CubeBackend {
         kernel::bool_cast(tensor, out_dtype.into())
     }
 
-    fn bool_to_device(tensor: BoolTensor<Self>, device: &Device<Self>) -> BoolTensor<Self> {
-        super::to_device(tensor, device)
+    fn bool_to_device(
+        tensor: BoolTensor<Self>,
+        device: &Device<Self>,
+        out_dtype: BoolDType,
+    ) -> BoolTensor<Self> {
+        let dtype = out_dtype.into();
+        if tensor.dtype == dtype {
+            return super::to_device(tensor, device);
+        }
+
+        if Self::supports_dtype(device, tensor.dtype) {
+            // The destination can read the source storage, even when the source cannot write
+            // the destination storage (WGSL U32 -> CPU U8).
+            kernel::bool_cast(super::to_device(tensor, device), dtype)
+        } else {
+            // U8 sources can write U32, the other storage supported by CubeCL backends.
+            super::to_device(kernel::bool_cast(tensor, dtype), device)
+        }
     }
 
     fn bool_reshape(tensor: BoolTensor<Self>, shape: Shape) -> BoolTensor<Self> {
@@ -172,13 +188,23 @@ impl BoolTensorOps<Self> for CubeBackend {
         kernel::select(tensor, dim, indices)
     }
 
-    fn bool_select_or(
+    fn bool_select_assign(
         tensor: BoolTensor<Self>,
         dim: usize,
         indices: IntTensor<Self>,
         value: BoolTensor<Self>,
+        update: IndexingUpdateOp,
     ) -> BoolTensor<Self> {
-        kernel::select_assign(tensor, dim, indices, value, true)
+        // Bools are stored as 0/1, so min is logical and.
+        match update {
+            IndexingUpdateOp::Assign => kernel::select_assign_replace(tensor, dim, indices, value),
+            IndexingUpdateOp::Add | IndexingUpdateOp::Max => {
+                kernel::select_assign(tensor, dim, indices, value, true)
+            }
+            IndexingUpdateOp::Mul | IndexingUpdateOp::Min => {
+                kernel::select_assign_min(tensor, dim, indices, value)
+            }
+        }
     }
 
     fn bool_flip(tensor: BoolTensor<Self>, axes: &[usize]) -> BoolTensor<Self> {
@@ -226,13 +252,36 @@ impl BoolTensorOps<Self> for CubeBackend {
         kernel::gather(dim, tensor, indices)
     }
 
-    fn bool_scatter_or(
+    fn bool_scatter(
         dim: usize,
         tensor: BoolTensor<Self>,
         indices: IntTensor<Self>,
         value: BoolTensor<Self>,
+        update: IndexingUpdateOp,
     ) -> BoolTensor<Self> {
-        kernel::scatter(dim, tensor, indices, value, true)
+        // Bools are stored as 0/1, so min is logical and.
+        match update {
+            IndexingUpdateOp::Assign => kernel::scatter_assign(dim, tensor, indices, value),
+            IndexingUpdateOp::Add | IndexingUpdateOp::Max => {
+                kernel::scatter(dim, tensor, indices, value, true)
+            }
+            IndexingUpdateOp::Mul | IndexingUpdateOp::Min => {
+                kernel::scatter_min(dim, tensor, indices, value)
+            }
+        }
+    }
+
+    fn bool_scatter_nd(
+        data: BoolTensor<Self>,
+        indices: IntTensor<Self>,
+        values: BoolTensor<Self>,
+        reduction: IndexingUpdateOp,
+    ) -> BoolTensor<Self> {
+        kernel::bool_scatter_nd(data, indices, values, reduction)
+    }
+
+    fn bool_gather_nd(data: BoolTensor<Self>, indices: IntTensor<Self>) -> BoolTensor<Self> {
+        kernel::gather_nd(data, indices)
     }
 
     fn bool_equal_elem(lhs: BoolTensor<Self>, rhs: Scalar) -> BoolTensor<Self> {

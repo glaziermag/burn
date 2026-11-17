@@ -2,8 +2,9 @@
 //!
 //! [`burn_pack::Tensor`] carries the format-level facts about a tensor (name, dtype, shape,
 //! optional param id) and a source for its raw little-endian bytes, which may not exist yet.
-//! burn-store uses it as its single tensor-transport type: what a [`Collector`](crate::Collector)
-//! produces, what an [`Applier`](crate::Applier) consumes, and what the stores read and write.
+//! It is what a [`Collector`](crate::Collector) produces and what the stores write. On the way
+//! in, a [`StoreTensor`] wraps it, or a source that can do more, until an
+//! [`Applier`](crate::Applier) has run the adapters and takes the data.
 //!
 //! This module is the seam where burn-core's [`TensorData`] meets those raw bytes. The lazy
 //! paths are the load-bearing ones: a tensor built by [`from_tensor`] holds the
@@ -12,16 +13,15 @@
 //! `from_pytorch` (with the `pytorch` feature) leaves a checkpoint tensor's bytes unread.
 
 use alloc::format;
-use alloc::string::String;
-// Only the `std` panic guard below builds an error message from a panic payload.
-#[cfg(feature = "std")]
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 
 use burn_pack::{Error as PackError, Tensor as PackTensor};
 
+use crate::StoreTensor;
+
 use burn_core::tensor::kind::Basic;
 use burn_core::tensor::quantization::quantized_data_len;
-use burn_core::tensor::{DType, Shape, Tensor, TensorData};
+use burn_core::tensor::{Bytes, DType, Shape, Tensor, TensorData};
 
 /// Number of bytes a tensor of this dtype and shape serializes to.
 ///
@@ -120,14 +120,17 @@ pub fn deferred(
         // The byte length is checked downstream, but two dtypes of the same width (F32 and
         // I32, say) produce identical lengths, and the declared one is what a reader will
         // reinterpret the bytes as. Nothing else catches that, so check it here.
-        if data.dtype != dtype || data.shape != declared {
+        if data.dtype() != dtype || *data.shape() != declared {
             return Err(PackError::ValidationError(format!(
                 "provider produced {:?} {:?}, but the tensor declared {:?} {:?}",
-                data.dtype, data.shape, dtype, declared
+                data.dtype(),
+                data.shape(),
+                dtype,
+                declared
             )));
         }
 
-        Ok(data.bytes)
+        Ok(data.into_bytes())
     })
 }
 
@@ -149,7 +152,8 @@ pub fn from_tensor<const D: usize, K: Basic + 'static>(
 
 /// Build a tensor from data already in hand.
 pub fn from_data(data: TensorData, name: String, param_id: Option<u64>) -> PackTensor {
-    PackTensor::new(name, data.dtype, data.shape.clone(), param_id, data.bytes)
+    let (bytes, shape, dtype) = data.into_parts();
+    PackTensor::new(name, dtype, shape, param_id, bytes)
 }
 
 /// Read a tensor's bytes back as [`TensorData`], leaving it intact.
@@ -158,18 +162,25 @@ pub fn from_data(data: TensorData, name: String, param_id: Option<u64>) -> PackT
 /// cached, and a resident one copies its bytes unless they can be shared. Prefer [`into_data`]
 /// where the tensor is not needed afterwards.
 pub fn to_data(tensor: &PackTensor) -> Result<TensorData, PackError> {
-    Ok(TensorData::from_bytes(
-        tensor.to_bytes()?,
-        tensor.shape.clone(),
-        tensor.dtype,
-    ))
+    tensor_data(tensor.to_bytes()?, tensor.shape.clone(), tensor.dtype)
 }
 
 /// Take a tensor's bytes as [`TensorData`], producing them if deferred.
 pub fn into_data(tensor: PackTensor) -> Result<TensorData, PackError> {
     let (_, dtype, shape, _, bytes) = tensor.into_parts()?;
 
-    Ok(TensorData::from_bytes(bytes, shape, dtype))
+    tensor_data(bytes, shape, dtype)
+}
+
+/// Build [`TensorData`] from raw bytes, reporting a length that disagrees with the shape and
+/// dtype as an error rather than a panic.
+pub(crate) fn tensor_data(
+    bytes: Bytes,
+    shape: Shape,
+    dtype: DType,
+) -> Result<TensorData, PackError> {
+    TensorData::try_from_bytes(bytes, shape, dtype)
+        .map_err(|err| PackError::TensorBytesSizeMismatch(err.to_string()))
 }
 
 /// Wrap a tensor's data in a transform, keeping it deferred.
@@ -182,23 +193,29 @@ pub fn into_data(tensor: PackTensor) -> Result<TensorData, PackError> {
 /// Takes the tensor by value: the closure holds it for the adapted tensor's whole lifetime, so
 /// borrowing here would only mean cloning it into the closure anyway.
 pub fn map_data(
-    tensor: PackTensor,
+    tensor: StoreTensor,
     name: String,
     dtype: DType,
     shape: Shape,
     f: impl Fn(TensorData) -> TensorData + MaybeSendSync + 'static,
-) -> PackTensor {
-    let param_id = tensor.param_id;
+) -> StoreTensor {
+    let param_id = tensor.param_id();
+    let tensor = tensor.into_pack();
 
     deferred(name, dtype, shape, param_id, move || {
         to_data(&tensor).map(&f)
     })
+    .into()
 }
 
 /// Wrap a PyTorch checkpoint tensor, leaving its bytes unread until they are drawn.
 ///
 /// PyTorch carries no parameter identity, so `param_id` stays `None`. Takes the tensor by
 /// value for the same reason [`map_data`] does.
+///
+/// This fixes the tensor's layout as row-major. Converting it into a [`StoreTensor`] instead
+/// keeps the reader's tensor, so an adapter can still read a matrix the checkpoint stores
+/// transposed in that order.
 #[cfg(feature = "pytorch")]
 pub fn from_pytorch(tensor: pytorch_reader::Tensor) -> PackTensor {
     use std::io::ErrorKind;
@@ -217,12 +234,12 @@ pub fn from_pytorch(tensor: pytorch_reader::Tensor) -> PackTensor {
             }
             _ => PackError::IoError(err.to_string()),
         })?;
-        Ok(TensorData::from_bytes_vec(bytes, declared.clone(), dtype))
+        tensor_data(Bytes::from_bytes_vec(bytes), declared.clone(), dtype)
     })
 }
 
 #[cfg(feature = "pytorch")]
-fn pytorch_dtype(dtype: pytorch_reader::DType) -> DType {
+pub(crate) fn pytorch_dtype(dtype: pytorch_reader::DType) -> DType {
     use burn_core::tensor::BoolStore;
     use pytorch_reader::DType as Pt;
 
@@ -264,7 +281,7 @@ mod tests {
         match to_data(&tensor) {
             Ok(data) => assert_eq!(
                 declared,
-                data.bytes.len(),
+                data.bytes().len(),
                 "byte_len disagrees with the materialized bytes for {name}"
             ),
             Err(e) => panic!("byte_len disagrees with the materialized bytes for {name}: {e}"),
@@ -293,18 +310,25 @@ mod tests {
     /// width rounds down to zero bytes if divided rather than div_ceil'd). A 32x32 Q8 tensor
     /// passes either way, so it cannot stand in for these.
     ///
-    /// Both axes rely on the test backend storing quantized values natively, one `i8` per
-    /// value: `quantize_dynamic` rewrites the scheme's store to `QuantStore::Native` even
-    /// though `QuantScheme::default()` starts as `PackedU32`. A backend honoring `PackedU32`
-    /// would produce 4-byte-exact value counts and exercise neither axis.
+    /// The `Native` schemes hit both; the packed ones check that each line's padding is counted.
     #[test]
     fn data_len_matches_materialized_bytes_when_quantized() {
         let device = Device::default();
 
+        let native = QuantScheme::default().with_store(QuantStore::Native);
         let schemes = [
-            ("q8", QuantScheme::default()),
-            ("q4", QuantScheme::default().with_value(QuantValue::Q4S)),
-            ("q2", QuantScheme::default().with_value(QuantValue::Q2S)),
+            ("q8", native),
+            ("q4", native.with_value(QuantValue::Q4S)),
+            ("q2", native.with_value(QuantValue::Q2S)),
+            ("q8-packed", QuantScheme::default()),
+            (
+                "q4-packed",
+                QuantScheme::default().with_value(QuantValue::Q4S),
+            ),
+            (
+                "q2-packed",
+                QuantScheme::default().with_value(QuantValue::Q2S),
+            ),
         ];
         // Element counts that are and are not multiples of the 4-byte scale alignment.
         let shapes = [shape![32, 32], shape![3, 3], shape![5, 5], shape![2, 3]];
@@ -341,8 +365,8 @@ mod tests {
                     TensorData::quantized(vec![0i8; values], [values], scheme, &scales, global);
 
                 assert_eq!(
-                    data_len(data.dtype, &data.shape),
-                    data.bytes.len(),
+                    data_len(data.dtype(), data.shape()),
+                    data.bytes().len(),
                     "predicted size disagrees with the written bytes for {values} values \
                      in blocks of {block}, {scheme:?}"
                 );
@@ -350,10 +374,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn data_len_matches_default_quantized_values() {
+        for values in [3usize, 4, 5] {
+            let data = TensorData::quantized(
+                vec![0i8; values],
+                [values],
+                QuantScheme::default(),
+                &[0.5],
+                None,
+            );
+
+            assert_eq!(
+                data_len(data.dtype(), data.shape()),
+                data.bytes().len(),
+                "predicted size disagrees for {values} default-scheme values"
+            );
+        }
+    }
+
     /// Packed quantized storage divides only the packed dimension, so a non-divisible extent
-    /// pads once per line rather than once over the flattened tensor. No current backend can
-    /// materialize such a tensor, so this pins the formula against the storage shape the
-    /// allocation would use (`CubeTensor::quantized_storage`) rather than against real bytes.
+    /// pads once per line rather than once over the flattened tensor, as `QuantizedBytes::new`
+    /// lays it out.
     #[test]
     fn data_len_packs_per_line_for_packed_stores() {
         // Q4 in u32 words: 8 values per storage element, packed along the last dimension.
@@ -473,7 +515,7 @@ mod tests {
         assert_eq!(floats.name, "float");
         assert_eq!(floats.shape, shape![2, 2]);
         assert_eq!(floats.param_id, Some(7));
-        assert_eq!(to_data(&floats).unwrap().shape, shape![2, 2]);
+        assert_eq!(*to_data(&floats).unwrap().shape(), shape![2, 2]);
 
         let ints = from_tensor(
             &Tensor::<2, Int>::from_data([[1, 2], [3, 4]], &device),
@@ -487,7 +529,7 @@ mod tests {
             "bool".to_string(),
             None,
         );
-        assert_eq!(to_data(&bools).unwrap().shape, shape![2, 2]);
+        assert_eq!(*to_data(&bools).unwrap().shape(), shape![2, 2]);
     }
 
     /// A provider that returns a different dtype than the tensor declared must be refused.
@@ -531,9 +573,9 @@ mod tests {
 
         let borrowed = to_data(&tensor).unwrap();
         let taken = into_data(tensor).unwrap();
-        assert_eq!(borrowed.shape, taken.shape);
-        assert_eq!(borrowed.dtype, taken.dtype);
-        assert_eq!(borrowed.bytes.to_vec(), taken.bytes.to_vec());
+        assert_eq!(borrowed.shape(), taken.shape());
+        assert_eq!(borrowed.dtype(), taken.dtype());
+        assert_eq!(borrowed.as_bytes(), taken.as_bytes());
     }
 
     /// `map_data` has to declare the length its transform will produce, not the one it
@@ -550,12 +592,16 @@ mod tests {
         assert_eq!(source.byte_len(), 16);
 
         let shape = source.shape.clone();
-        let cast = map_data(source, "weight".to_string(), DType::F16, shape, |data| {
-            data.convert_dtype(DType::F16)
-        });
+        let cast = map_data(
+            source.into(),
+            "weight".to_string(),
+            DType::F16,
+            shape,
+            |data| data.convert_dtype(DType::F16),
+        );
 
         assert_eq!(cast.byte_len(), 8);
-        assert_byte_len_matches(cast);
+        assert_byte_len_matches(cast.into_pack());
     }
 
     /// A checkpoint tensor crosses over with its identity intact and its bytes reinterpreted

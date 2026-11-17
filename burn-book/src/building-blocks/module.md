@@ -27,7 +27,39 @@ impl PositionWiseFeedForward {
 }
 ```
 
-Note that all fields declared in the struct must also implement the `Module` trait.
+## Fields and generic adapters
+
+Fields must implement `Module` and `ModuleDisplay`, unless they are recognized constants (such as
+`usize`, `f32`, `bool` or `String`) or marked `#[module(skip)]`. Use the attribute for custom
+configuration and runtime state, including generic fields. Skipped fields still need
+`Clone + Debug + Send`; they are cloned but excluded from traversal, checkpoints, device movement
+and training/validation transitions.
+
+Bounds are inferred from field types, so a child `Wrapper<T>` needs `Module + ModuleDisplay`
+without requiring `T` to implement those traits. For a generic child `M` and configuration `C`,
+mark the `C` field with `#[module(skip)]`. Your own `Forward` bounds are preserved; the derive
+does not constrain forward methods.
+
+Named and tuple structs can contain recursive children such as `Vec<Self>` or `Option<Box<Self>>`.
+These children participate in traversal, checkpoints and state transitions like any other submodule.
+
+Enums can also derive `Module`. A variant holds either a single unnamed field or named fields:
+
+```rust, ignore
+#[derive(Module, Debug)]
+pub enum Head {
+    Small(Linear),
+    Wide { first: Linear, second: Linear },
+}
+```
+
+Named fields are saved under the variant and the field name (`Wide.first.weight`), the same names
+as a tuple variant wrapping a struct with those fields. Unit variants and tuple variants with
+several fields are not supported.
+
+Custom generic types such as `Block<f32>` are treated as submodules; use `#[module(skip)]` if they
+hold configuration instead. For structures requiring custom traversal, use a
+[manual implementation](https://github.com/tracel-ai/burn/blob/release/0.22/burn-book/src/migrating-to-0.22.md#manual-module-implementations).
 
 ## Forward Contract
 
@@ -373,17 +405,64 @@ let model = model.apply_lora(Lora::new(8, 16.0));
 
 The `Reparameterizer` receives every floating-point parameter and its module path. It decides which
 parameters to transform, prepares their structural bases, and optionally attaches a
-`Reparameterization`. A reparameterization is itself a regular module, so its parameters
-automatically participate in visitors, mappers, optimization, records, device transfers, and
-autodiff. Custom techniques implement these traits and are applied through
-`apply_reparameterization`, making custom parameter-level PEFT methods possible without modifying
-the original model or layer.
+`Reparameterization`, whose `apply(base)` method computes the effective value. A reparameterization
+is itself a regular module, so its parameters automatically participate in visitors, mappers,
+optimization, records, device transfers, and autodiff. Custom techniques implement these traits and
+are applied through `apply_reparameterization`, making custom parameter-level PEFT methods possible
+without modifying the original model or layer.
 
 LoRA and QLoRA are built on the same mechanism but provide the convenience methods `apply_lora` and
 `apply_qlora` for normal use. Reparameterizations cannot currently be nested, so
 `apply_reparameterization` should only be called on a module that does not already contain
 reparameterized parameters. Use `Param::base()` to access the stored base directly and
 `Param::val()` to obtain the materialized value.
+
+### Validation and materialization
+
+`valid()` disables autodiff and training flags while keeping base weights and adapters separate. It
+does not select which parameters are saved: `valid().into_record()` includes both the base weights
+and adapter factors. For adapter-only export, select the factors with `into_record_group`:
+
+```rust, ignore
+use burn::module::{Lora, Module, ParamGroup};
+use burn::store::ModuleRecord;
+
+// Select the built-in LoRA factors, including those used by QLoRA.
+let adapters = ParamGroup::from_regex(r"(^|\.)lora\.(a|b)$").unwrap();
+model
+    .valid()
+    .into_record_group(adapters)
+    .save("adapters.bpk")
+    .unwrap();
+
+// Start from the original base checkpoint and attach the same adapter configuration.
+let restored = base_model
+    .apply_lora(Lora::new(8, 16.0))
+    .valid()
+    .load_record(ModuleRecord::load("adapters.bpk").unwrap().allow_partial(true));
+```
+
+Here, `base_model` has already loaded the original base weights, and the LoRA configuration matches
+the one used for training. For QLoRA, recreate the same packed base and adapters with `apply_qlora`
+instead. Adapter-only records contain the factor tensors; they do not include the base weights or
+adapter configuration. `allow_partial(true)` leaves parameters absent from the record unchanged.
+
+`materialize()` folds reparameterizations into the weights and removes their structure. Use a merged
+snapshot for repeated inference without recomputing adapter updates, or to export a standalone
+model:
+
+```rust, ignore
+let validation = model.valid(); // Keep adapters for evaluation and adapter-only export.
+let merged = validation.clone().materialize(); // Merge them for inference or full-model export.
+```
+
+Materialization does not change training mode and cannot be undone; keep the original model if you
+need its adapters. Parameters without reparameterizations remain lazy. For QLoRA, materialization
+produces dense weights. Requantization is separate and can change the model's outputs.
+
+QLoRA forward passes can still materialize dense effective weights. Autodiff may retain them for
+backward and compute full weight-shaped gradients. Fusion can avoid a separate dequantized base
+allocation, but does not eliminate all dense intermediates.
 
 ## Module Display
 
@@ -442,6 +521,9 @@ impl ModuleDisplay for PositionWiseFeedForward {
 ## Built-in Modules
 
 Burn comes with built-in modules that you can use to build your own modules.
+
+`CosineSimilarity`, `PairwiseDistance`, `CosineEmbeddingLoss`, `TripletMarginLoss`, and
+`Initializer::Orthogonal` require the `linalg` feature of `burn`.
 
 ### General
 
@@ -528,18 +610,34 @@ Interpolation modules resize tensors using one of the available `InterpolateMode
 | Mode      | Description                                        |
 | --------- | -------------------------------------------------- |
 | `Nearest` | Nearest-neighbor interpolation                     |
+| `NearestExact` | Nearest-neighbor interpolation with half-pixel mapping |
 | `Linear`  | Linear interpolation (bilinear for 2D)             |
 | `Cubic`   | Cubic interpolation (bicubic for 2D)               |
 | `Lanczos` | Lanczos3 resampling (6-tap sinc-based filter, a=3) |
 
-Configuration is done via `Interpolate1dConfig` / `Interpolate2dConfig` with these options:
+Configuration is done via `Interpolate1dConfig` / `Interpolate2dConfig` with these options. Exactly
+one of `output_size` or `scale_factor` must be set; `forward` panics otherwise.
 
-| Option          | Type                                   | Default   | Description                                             |
-| --------------- | -------------------------------------- | --------- | ------------------------------------------------------- |
-| `output_size`   | `Option<usize>` / `Option<[usize; 2]>` | `None`    | Target output size (takes precedence over scale_factor) |
-| `scale_factor`  | `Option<f32>` / `Option<[f32; 2]>`     | `None`    | Scale factor for resizing                               |
-| `mode`          | `InterpolateMode`                      | `Nearest` | Interpolation algorithm                                 |
-| `align_corners` | `bool`                                 | `true`    | Align input/output corner pixels                        |
+| Option          | Type                                   | Default   | Description                                    |
+| --------------- | -------------------------------------- | --------- | ---------------------------------------------- |
+| `output_size`   | `Option<usize>` / `Option<[usize; 2]>` | `None`    | Target output size; set this or `scale_factor` |
+| `scale_factor`  | `Option<f32>` / `Option<[f32; 2]>`     | `None`    | Output is `floor(input * scale_factor)`        |
+| `mode`          | `InterpolateMode`                      | `Nearest` | Interpolation algorithm                        |
+
+Algorithm-specific settings belong to the `InterpolateMode` variants.
+`Linear`, `Cubic` and `Lanczos` accept `HalfPixel` or `AlignCorners` coordinate transforms.
+`Nearest` uses fixed asymmetric coordinates with floor rounding; `NearestExact` uses fixed
+half-pixel coordinates with ties rounded upward.
+
+```rust,ignore
+Interpolate2dConfig::new()
+    .with_output_size(Some([224, 224]))
+    .with_mode(InterpolateMode::Cubic {
+        coordinate_transform: CoordinateTransformMode::HalfPixel,
+        a: -0.75,
+    })
+    .init();
+```
 
 ### RNNs
 

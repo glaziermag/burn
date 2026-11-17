@@ -3,6 +3,8 @@ use super::args::{
 };
 #[cfg(feature = "autotune")]
 use super::tune::fused_reduce_autotune;
+#[cfg(feature = "autotune")]
+use crate::tune::TunedTrace;
 use crate::{
     CubeFusionHandle, FallbackOperation,
     engine::{
@@ -107,6 +109,13 @@ impl Clone for ReduceOptimizationTuneArg {
             info: self.info.clone(),
             fallback: self.fallback.clone(),
         }
+    }
+}
+
+#[cfg(feature = "autotune")]
+impl TunedTrace for ReduceOptimizationTuneArg {
+    fn trace(&self) -> &FuseTrace {
+        &self.info.trace
     }
 }
 
@@ -265,6 +274,14 @@ impl ReduceOptimization {
             fallback: Arc::new(fallback),
         };
 
+        // Same as `ReduceBroadcastedOptimization::execute`: an empty input leaves the fused
+        // kernels either an axis they reject or nothing to launch over.
+        let input = context.tensors.get(&self.info.reduce.op.input.id).unwrap();
+        if input.shape.num_elements() == 0 {
+            arg.execute_fallback(context);
+            return;
+        }
+
         #[cfg(feature = "autotune")]
         fused_reduce_autotune(arg, context);
 
@@ -336,12 +353,14 @@ impl TraceRunner for FusedReduceLaunch<'_> {
         configs: &'a [FuseBlockConfig],
     ) -> Result<(), FusedReduceError> {
         let [config_read, config_write] = [&configs[0], &configs[1]];
-        let shape = match &config_read.ref_layout {
-            RefLayout::Concrete(FuseArg::Output(..)) => {
-                outputs.shape_ref(&config_read.ref_layout, config_read.rank)
-            }
-            _ => inputs.shape_ref(&config_read.ref_layout, config_read.rank),
+        // An output-concrete reference indexes the output arguments; shape and
+        // strides must both be resolved against that list.
+        let ref_args = match &config_read.ref_layout {
+            RefLayout::Concrete(FuseArg::Output(..)) => &outputs,
+            _ => &inputs,
         };
+        let shape = ref_args.shape_ref(&config_read.ref_layout, config_read.rank);
+        let ref_strides = ref_args.strides_ref(&config_read.ref_layout, config_read.rank);
         let reduce_count: usize = shape
             .iter()
             .enumerate()
@@ -395,11 +414,8 @@ impl TraceRunner for FusedReduceLaunch<'_> {
             }
         };
 
-        let out_vec_axis = output_vectorization_axis(
-            &inputs.strides_ref(&config_read.ref_layout, config_read.rank),
-            self.reduce.axis,
-            vectorization_mode,
-        );
+        let out_vec_axis =
+            output_vectorization_axis(&ref_strides, self.reduce.axis, vectorization_mode);
 
         let kwargs = ReduceKwArgs {
             client,

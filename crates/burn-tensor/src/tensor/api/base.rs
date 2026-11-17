@@ -1,5 +1,5 @@
 #![allow(clippy::single_range_in_vec_init)]
-use crate::check::{unwrap_dim_index, unwrap_shape_reshape};
+use crate::check::unwrap_dim_index;
 use crate::kind::Basic;
 use crate::ops::BridgeTensor;
 
@@ -141,13 +141,22 @@ where
     /// uniquely owns the allocation, so an in-place op writes it directly
     /// instead of copying first (see `TensorMetadata::can_mut`).
     ///
-    /// Backends that track buffer ownership (cubecl, fusion, tch) answer
+    /// Backends that track buffer ownership (cubecl, fusion) answer
     /// precisely from the handle reference count; others conservatively return
     /// `false` — they may alias the buffer, so an in-place write can't be
     /// assumed safe. Useful to assert a hot-path op (e.g. a KV-cache
     /// `slice_assign`) stays in place rather than silently copying.
     pub fn can_mut(&self) -> bool {
         self.primitive.can_mut()
+    }
+
+    /// Returns the unique identifier of the tensor if allocated on `CaptureBackend`.
+    ///
+    /// # Panics
+    /// Panics if the tensor is not allocated on `CaptureBackend`.
+    #[cfg(feature = "capture")]
+    pub fn capture_id(&self) -> burn_capture::TensorId {
+        burn_capture::CaptureTensor::capture_id(self)
     }
 
     /// Create an empty tensor of the given shape.
@@ -175,6 +184,10 @@ where
 
     /// Create an empty tensor with the same shape, dtype, and device as the current tensor.
     ///
+    /// # Panics
+    ///
+    /// If the tensor is quantized. This method preserves the input dtype,
+    /// but quantized tensor creation is not supported.
     ///
     /// # Example
     /// ```rust
@@ -187,7 +200,9 @@ where
     /// let tensor = tensor.empty_like();
     /// ```
     pub fn empty_like(&self) -> Self {
-        Self::new(K::empty(self.shape(), &self.device(), self.dtype()))
+        let dtype = self.dtype();
+        check!(TensorCheck::quantized_unsupported("Empty Like", dtype));
+        Self::new(K::empty(self.shape(), &self.device(), dtype))
     }
 
     /// The dtype to create a new tensor with so that it matches this one, used by ops that
@@ -223,6 +238,11 @@ where
 
     /// Returns a new tensor with the same shape, dtype, and device as the current tensor filled with zeros.
     ///
+    /// # Panics
+    ///
+    /// If the tensor is quantized. This method preserves the input dtype,
+    /// but quantized tensor creation is not supported.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -235,7 +255,9 @@ where
     /// // [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
     /// ```
     pub fn zeros_like(&self) -> Self {
-        Self::new(K::zeros(self.shape(), &self.device(), self.dtype()))
+        let dtype = self.dtype();
+        check!(TensorCheck::quantized_unsupported("Zeros Like", dtype));
+        Self::new(K::zeros(self.shape(), &self.device(), dtype))
     }
 
     /// Create a tensor of the given shape where each element is one.
@@ -260,6 +282,11 @@ where
 
     /// Returns a new tensor with the same shape, dtype, and device as the current tensor filled with ones.
     ///
+    /// # Panics
+    ///
+    /// If the tensor is quantized. This method preserves the input dtype,
+    /// but quantized tensor creation is not supported.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -272,7 +299,9 @@ where
     /// // [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]
     /// ```
     pub fn ones_like(&self) -> Self {
-        Self::new(K::ones(self.shape(), &self.device(), self.dtype()))
+        let dtype = self.dtype();
+        check!(TensorCheck::quantized_unsupported("Ones Like", dtype));
+        Self::new(K::ones(self.shape(), &self.device(), dtype))
     }
 
     /// Create a tensor of the given shape where each element is equal to the provided value.
@@ -307,6 +336,11 @@ where
     /// Returns a new tensor with the same shape, dtype, and device as the current tensor,
     /// filled with the provided value.
     ///
+    /// # Panics
+    ///
+    /// If the tensor is quantized. This method preserves the input dtype,
+    /// but quantized tensor creation is not supported.
+    ///
     /// # Example
     ///
     /// ```rust
@@ -320,6 +354,7 @@ where
     /// ```
     pub fn full_like<E: ElementConversion>(&self, fill_value: E) -> Self {
         let dtype = self.dtype();
+        check!(TensorCheck::quantized_unsupported("Full Like", dtype));
         Self::new(K::full(
             self.shape(),
             Scalar::new(fill_value, &dtype),
@@ -362,34 +397,50 @@ where
     ///
     /// The tensor has the same data and number of elements as the input.
     ///
-    /// A `-1` in the shape is used to infer the remaining dimensions, e.g.: `[2, -1]`
-    /// will reshape the tensor with [2, 3, 4] dimensions to [2, 12].
+    /// Nonnegative dimensions are literal sizes, including zero-length dimensions. An array
+    /// can contain a single `-1` to infer a dimension from the element count. For example,
+    /// `[2, -1]` reshapes an input of shape `[2, 3, 4]` to `[2, 12]`.
     ///
-    /// A `0` in the shape instructs to keep the current dimension from the original tensor,
-    /// e.g.: `[2, 0, 4]` will reshape the tensor with [2, 3, 4] dimensions to [2, 3, 4].
-    /// This is useful when reshaping tensors with unknown dimensions and combining with `-1`
-    /// to infer the remaining dimensions, e.g. `[0, -1]` will reshape the tensor
-    /// with [1, 3, 4] dimensions to [1, 12].
+    /// A [`Shape`] is an already-resolved result containing concrete dimension sizes. It is
+    /// used as given, including any zero-length dimensions, with no dimension inference.
+    ///
+    /// Wrap an array in [`ZeroDimPlaceholders`] to make `0` copy the input dimension at the
+    /// same position instead. For example, `ZeroDimPlaceholders([0, -1])` reshapes an input
+    /// of shape `[2, 3, 4]` to `[2, 12]`. This opt-in follows ONNX's `allowzero=0` semantics;
+    /// ordinary arrays follow `allowzero=1` semantics.
     ///
     /// # Arguments
-    /// - `shape`: The new shape of the tensor.
+    /// - `shape`: An array, a resolved [`Shape`], or an array wrapped in [`ZeroDimPlaceholders`].
     ///
     /// # Panics
-    /// - If the tensor contains more than one `-1` in the shape.
-    /// - If the tensor contains values that are not positive (other than -1).
-    /// - If the shape does not match the number of elements of the original shape.
+    /// - If the shape array contains more than one `-1`.
+    /// - If the shape array contains a dimension below `-1`.
+    /// - If `-1` cannot be inferred uniquely, including when another resolved dimension is zero.
+    /// - If a `0` in [`ZeroDimPlaceholders`] has no corresponding input dimension to copy.
+    /// - If the resolved shape does not have the same number of elements as the original shape.
+    /// - If a given [`Shape`] does not have `D2` dimensions.
     ///
     /// # Example
     ///
     /// ```rust
-    /// use burn_tensor::Tensor;
+    /// use burn_tensor::{Shape, Tensor, ZeroDimPlaceholders};
     ///
     /// let device = Default::default();
     /// // Create a tensor with dimensions [2, 3, 4]
     /// let tensor = Tensor::<3>::ones([2, 3, 4], &device);
-    /// // Reshape it to [2, 12], where 12 is inferred from the number of elements.
-    /// let reshaped = tensor.reshape([2, -1]);
-    /// println!("{reshaped}");
+    /// // Infer the second dimension.
+    /// let reshaped = tensor.clone().reshape([2, -1]);
+    /// assert_eq!(reshaped.dims(), [2, 12]);
+    /// // Explicitly copy the first input dimension and infer the second.
+    /// let reshaped = tensor.reshape(ZeroDimPlaceholders([0, -1]));
+    /// assert_eq!(reshaped.dims(), [2, 12]);
+    ///
+    /// // Arrays and Shape both preserve literal zeros.
+    /// let empty = Tensor::<3>::zeros([1, 24, 0], &device);
+    /// let reshaped = empty.clone().reshape([1, 24, 16, 0]);
+    /// assert_eq!(reshaped.dims(), [1, 24, 16, 0]);
+    /// let reshaped: Tensor<4> = empty.reshape(Shape::new([1, 24, 16, 0]));
+    /// assert_eq!(reshaped.dims(), [1, 24, 16, 0]);
     /// ```
     pub fn reshape<const D2: usize, S: ReshapeArgs<D2>>(self, shape: S) -> Tensor<D2, K> {
         // Convert reshape args to shape
@@ -1099,10 +1150,11 @@ where
             );
         }
 
+        let split = self.shape()[dim] - shift;
         Tensor::cat(
             vec![
-                self.clone().slice_dim(dim, shift..),
-                self.slice_dim(dim, ..shift),
+                self.clone().slice_dim(dim, split..),
+                self.slice_dim(dim, ..split),
             ],
             dim,
         )
@@ -1607,6 +1659,9 @@ where
 
     /// Moves the tensor to the target device's compute resource.
     ///
+    /// Boolean values and storage dtype are preserved when the destination supports that storage.
+    /// Otherwise, boolean tensors use the destination's configured bool storage dtype.
+    ///
     /// This operation preserves the tensor's autodiff association and gradient-checkpointing
     /// strategy; the target device's autodiff configuration isn't applied. Tensors newly created
     /// on a device inherit its configuration, while tensors moved to that device retain their
@@ -1666,12 +1721,12 @@ where
     /// from the value tensor to the original tensor using the requested update operation.
     ///
     /// # Note
-    /// - `IndexingUpdateOp::Add` accumulates values at the selected positions (`+=`). For
-    ///   booleans, `Add` is logical or.
+    /// - `IndexingUpdateOp::Add` accumulates values at the selected positions (`+=`).
     /// - `IndexingUpdateOp::Assign` replaces values at the selected positions (`=`), when
     ///   supported by the backend.
     /// - `IndexingUpdateOp::Mul` multiplies values at the selected positions (`*=`), when
     ///   supported by the backend.
+    /// - For booleans, `Add` and `Max` are logical or, and `Mul` and `Min` are logical and.
     ///
     /// When `indices` contains duplicate entries, behavior varies by operation:
     /// - For `Add`, accumulation is supported, though results may be non-deterministic on GPU
@@ -1866,11 +1921,12 @@ where
     ///
     /// # Notes
     ///
-    /// The index tensor should have the same shape as the original tensor except for the dim
-    /// specified.
+    /// The index tensor must not be larger than the original tensor on any dimension except the
+    /// specified dim (`indices.shape[d] <= tensor.shape[d]` for `d != dim`), like PyTorch's
+    /// `gather`. The output has the shape of the index tensor.
     ///
     /// # Warning
-    /// Not all backends have runtime bound checks for the indices, so make sure the they are valid.
+    /// Not all backends have runtime bound checks for the indices, so make sure they are valid.
     /// Otherwise, out of bounds indices could lead to unexpected results instead of panicking.
     pub fn gather(self, dim: impl AsIndex, indices: Tensor<D, Int>) -> Self {
         let dim = unwrap_dim_index(dim.try_dim_index(D), "Gather");
@@ -1916,8 +1972,12 @@ where
     ///
     /// # Notes
     ///
-    /// The index tensor should have the same shape as the original tensor except for the specified
-    /// dimension. The value and index tensors should have the same shape.
+    /// The index tensor must not be larger than the original tensor on any dimension except the
+    /// specified one (`indices.shape[d] <= tensor.shape[d]` for `d != dim`), like PyTorch's
+    /// `scatter`; only the positions it covers are updated. The value and index tensors must
+    /// have the same shape.
+    ///
+    /// For booleans, `Add` and `Max` are logical or, and `Mul` and `Min` are logical and.
     ///
     /// When `indices` contains duplicate entries, behavior varies by operation:
     /// - For `Add`, accumulation is supported, though results may be non-deterministic on GPU
@@ -1935,7 +1995,7 @@ where
     /// Other references to the input tensor will not be modified by this operation.
     ///
     /// # Warning
-    /// Not all backends have runtime bound checks for the indices, so make sure the they are valid.
+    /// Not all backends have runtime bound checks for the indices, so make sure they are valid.
     /// Otherwise, out of bounds indices could lead to unexpected results instead of panicking.
     ///
     /// # Panics
@@ -1976,6 +2036,8 @@ where
     /// * `update` - The operation used to update the existing values at the indexed positions (e.g., add).
     ///
     /// # Note
+    ///
+    /// For booleans, `Add` and `Max` are logical or, and `Mul` and `Min` are logical and.
     ///
     /// When `indices` contains duplicate entries, behavior varies by operation:
     /// - For `Add`, accumulation is supported, though results may be non-deterministic on GPU
@@ -2312,6 +2374,27 @@ where
     }
 
     /// Create a tensor from the given data on the given device.
+    ///
+    /// For `Float` and `Int` tensors, the dtype follows the
+    /// [creation options](TensorCreationOptions). Without an explicit `dtype`, it defaults to the
+    /// [device settings](crate::DeviceSettings), so `Int` tensors created from `i64` data use the
+    /// device's default int dtype unless a dtype is passed explicitly. `Bool` tensors always use
+    /// the device's default bool storage.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use burn_tensor::{DType, Int, Tensor, TensorData};
+    ///
+    /// let device = Default::default();
+    /// let data = TensorData::new(vec![1i64, 2], [2]);
+    ///
+    /// // The device's default int dtype is used (I32 on Flex), not the data dtype.
+    /// let tensor = Tensor::<1, Int>::from_data(data.clone(), &device);
+    ///
+    /// // Pass the dtype explicitly to create an I64 tensor from the same data.
+    /// let tensor = Tensor::<1, Int>::from_data(data, (&device, DType::I64));
+    /// ```
     pub fn from_data<T>(data: T, options: impl Into<TensorCreationOptions>) -> Self
     where
         T: Into<TensorData>,
@@ -2319,7 +2402,7 @@ where
         let data = data.into();
         check!(TensorCheck::creation_ops::<D>(
             "From Data",
-            data.shape.as_slice()
+            data.shape().as_slice()
         ));
 
         // Use the given dtype when provided, otherwise default device dtype
@@ -2738,25 +2821,10 @@ where
                 .collect();
         }
 
-        let mut tensors = Vec::with_capacity(chunks);
-        let mut sum_chunk_size = 0;
-        if size.is_multiple_of(chunks) {
-            let chunk_size = size / chunks;
-            for _ in 0..chunks {
-                tensors.push(Self::narrow(self.clone(), dim, sum_chunk_size, chunk_size));
-                sum_chunk_size += chunk_size;
-            }
-        } else {
-            let chunk_size = (size / chunks) + 1; // assumes not divisible
-            for _ in 0..chunks - 1 {
-                tensors.push(Self::narrow(self.clone(), dim, sum_chunk_size, chunk_size));
-                sum_chunk_size += chunk_size;
-            }
-            let remainder = size % chunk_size;
-            tensors.push(Self::narrow(self.clone(), dim, sum_chunk_size, remainder));
-        }
-
-        tensors
+        // Every chunk holds `ceil(size / chunks)` elements except the last one, which holds the
+        // rest. When `chunks - 1` full chunks already cover the dimension (e.g. 6 elements into 4
+        // chunks of 2), fewer chunks are returned rather than an empty or out-of-range one.
+        self.split(size.div_ceil(chunks), dim)
     }
 
     /// Splits the tensor into chunks of a specified size along a given dimension.
@@ -3056,7 +3124,7 @@ where
     }
 
     fn _unpack_scalar<E: Element>(data: TensorData) -> Result<E, TensorReadError> {
-        let actual = data.shape.num_elements();
+        let actual = data.num_elements();
         if actual != 1 {
             return Err(TensorReadError::InvalidShape {
                 expected: 1,
@@ -3131,11 +3199,6 @@ where
     /// The new view will have the unfolded dimension replaced by two dimensions;
     /// one in the position of the original dimension, with size equal to the number of windows,
     /// and one appended to the right-most position, with size equal to `size`.
-    ///
-    /// # Warning
-    ///
-    /// For the `ndarray` backend; this is not a view but a copy
-    /// with duplicated data.
     ///
     /// # Arguments
     ///
@@ -3253,7 +3316,7 @@ fn fmt_elem<E: Element>(elem: E) -> String {
 // TODO: refactor display
 impl DataIterFmt {
     fn next(&self) -> String {
-        match self.data.dtype {
+        match self.data.dtype() {
             DType::F64 => fmt_float(self.next_elem::<f64>(), self.precision),
             DType::F32 | DType::Flex32 => fmt_float(self.next_elem::<f32>(), self.precision),
             DType::F16 => fmt_float(self.next_elem::<burn_std::f16>(), self.precision),
@@ -3271,7 +3334,8 @@ impl DataIterFmt {
                 burn_std::BoolStore::U8 => fmt_elem(self.next_elem::<u8>().to_bool()),
                 burn_std::BoolStore::U32 => fmt_elem(self.next_elem::<u32>().to_bool()),
             },
-            DType::QFloat(_) => todo!(), // unreachable but we should fix that
+            // Never panic: quantized tensors are displayed as metadata only.
+            DType::QFloat(_) => String::from("<quantized>"),
         }
     }
 
@@ -3368,21 +3432,58 @@ macro_rules! impl_movedim_args {
 
 impl_movedim_args!(usize, isize, i64, u64, i32, u32, i16, u16, i8, u8);
 
-/// Trait used for reshape arguments.
+/// Arguments to [`Tensor::reshape`].
+///
+/// Arrays contain literal sizes, including zeros, and may use `-1` to infer one dimension.
+/// A [`Shape`] is an already-resolved result containing only concrete dimension sizes.
+/// [`ZeroDimPlaceholders`] opts an array into copying input dimensions at zero entries.
 pub trait ReshapeArgs<const D2: usize>: Debug {
-    /// Converts to a shape.
+    /// Resolves and validates the output dimensions against `source`.
     fn into_shape<const D: usize>(self, source: Shape) -> Shape;
 }
 
 impl<const D2: usize, I: AsIndex> ReshapeArgs<D2> for [I; D2] {
     fn into_shape<const D: usize>(self, source: Shape) -> Shape {
-        unwrap_shape_reshape(source.reshape(self))
+        let args = self.map(|dim| dim.as_index());
+        check!(TensorCheck::reshape_args(&source, &args));
+
+        let mut dims = args.map(|dim| if dim == -1 { 1 } else { dim as usize });
+        if let Some(index) = args.iter().position(|&dim| dim == -1) {
+            let known_size = dims.iter().product();
+            check!(TensorCheck::reshape_infer(&source, &args, known_size));
+            dims[index] = source.num_elements() / known_size;
+        }
+
+        ReshapeArgs::<D2>::into_shape::<D>(Shape::new(dims), source)
+    }
+}
+
+/// A reshape array whose zero entries copy the corresponding input dimensions.
+///
+/// Positive values remain literal sizes, and `-1` infers one dimension. This opts into ONNX's
+/// `allowzero=0` semantics; ordinary arrays passed to [`Tensor::reshape`] treat zeros literally.
+/// Copied dimensions may themselves be zero. Inference is ambiguous if any resolved dimension
+/// other than `-1` is zero.
+#[derive(Debug, Clone, Copy)]
+pub struct ZeroDimPlaceholders<I, const D: usize>(pub [I; D]);
+
+impl<const D2: usize, I: AsIndex> ReshapeArgs<D2> for ZeroDimPlaceholders<I, D2> {
+    fn into_shape<const D: usize>(self, source: Shape) -> Shape {
+        let mut args = self.0.map(|dim| dim.as_index());
+        check!(TensorCheck::reshape_placeholders(&source, &args));
+        for (index, dim) in args.iter_mut().enumerate() {
+            if *dim == 0 {
+                *dim = source[index].as_index();
+            }
+        }
+        ReshapeArgs::<D2>::into_shape::<D>(args, source)
     }
 }
 
 impl<const D2: usize> ReshapeArgs<D2> for Shape {
     fn into_shape<const D: usize>(self, source: Shape) -> Shape {
-        unwrap_shape_reshape(source.reshape(self))
+        check!(TensorCheck::reshape::<D2>(&source, &self));
+        self
     }
 }
 
@@ -3664,29 +3765,35 @@ fn display_fmt_impl(
 ) -> core::fmt::Result {
     writeln!(f, "Tensor {{")?;
     {
-        let mut po = { PRINT_OPTS.read().clone() };
-        if let Some(precision) = f.precision() {
-            po.precision = Some(precision);
+        // Quantized tensors show metadata only (like candle): values are codes with scales,
+        // so use `dequantize()` for values or `to_data()` for the stored codes.
+        if primitive.is_qfloat() {
+            writeln!(f, "  data:  <quantized, use .dequantize() to view values>,")?;
+        } else {
+            let mut po = { PRINT_OPTS.read().clone() };
+            if let Some(precision) = f.precision() {
+                po.precision = Some(precision);
+            }
+            let shape = primitive.shape();
+            let dims: Vec<usize> = shape.iter().copied().collect();
+            let mut acc = String::new();
+            let mut multi_index = vec![0; dims.len()];
+            let num_elements: usize = dims.iter().product();
+            let summarize = num_elements > po.threshold;
+            display_fmt_recursive(
+                primitive,
+                kind,
+                &mut acc,
+                0,
+                &mut multi_index,
+                &po,
+                summarize,
+                &dims,
+            );
+            writeln!(f, "  data:")?;
+            write!(f, "{acc}")?;
+            writeln!(f, ",")?;
         }
-        let shape = primitive.shape();
-        let dims: Vec<usize> = shape.iter().copied().collect();
-        let mut acc = String::new();
-        let mut multi_index = vec![0; dims.len()];
-        let num_elements: usize = dims.iter().product();
-        let summarize = num_elements > po.threshold;
-        display_fmt_recursive(
-            primitive,
-            kind,
-            &mut acc,
-            0,
-            &mut multi_index,
-            &po,
-            summarize,
-            &dims,
-        );
-        writeln!(f, "  data:")?;
-        write!(f, "{acc}")?;
-        writeln!(f, ",")?;
     }
     writeln!(f, "  shape:  {},", primitive.shape())?;
     let device = match kind {
@@ -3698,6 +3805,9 @@ fn display_fmt_impl(
     writeln!(f, "  kind:  {:?},", kind_name)?;
     let dtype = primitive.dtype();
     writeln!(f, "  dtype:  {:?},", dtype.name())?;
+    if let DType::QFloat(scheme) = dtype {
+        writeln!(f, "  scheme:  {scheme:?},")?;
+    }
     write!(f, "}}")
 }
 
@@ -3712,12 +3822,33 @@ fn try_into_data_sync_impl(
     )
 }
 
+#[cfg(feature = "capture")]
+impl<const D: usize, K: Basic> burn_capture::CaptureTensor for Tensor<D, K> {
+    fn capture_id(&self) -> burn_capture::TensorId {
+        #[allow(unreachable_patterns)]
+        match &self.primitive.as_dispatch().kind {
+            burn_dispatch::DispatchTensorKind::Capture(backend_tensor) => match backend_tensor {
+                burn_dispatch::BackendTensor::Float(tensor) => tensor.id(),
+                burn_dispatch::BackendTensor::Int(tensor) => tensor.id(),
+                burn_dispatch::BackendTensor::Bool(tensor) => tensor.id(),
+                burn_dispatch::BackendTensor::Quantized(tensor) => tensor.id(),
+                #[cfg(feature = "autodiff")]
+                burn_dispatch::BackendTensor::Autodiff(_) => {
+                    panic!("Capture tensors do not support autodiff")
+                }
+            },
+            _ => panic!("Tensor is not allocated on CaptureBackend"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use burn_std::SliceOps;
 
     use crate::Slice;
+    use crate::quantization::QuantScheme;
 
     use crate::s;
 
@@ -3866,5 +3997,24 @@ mod tests {
         let slices = shape.into_slices(slice);
         assert_eq!(slices[0].to_range(3), 1..2);
         assert_eq!(slices[1].to_range(4), 0..4);
+    }
+
+    #[test]
+    fn data_iter_fmt_formats_quantized_as_placeholder() {
+        let data = TensorData::quantized(
+            vec![-127i8, 0, 64, 127],
+            [4],
+            QuantScheme::default(),
+            &[0.1],
+            None,
+        );
+        assert_eq!(
+            DataIterFmt {
+                data,
+                precision: None
+            }
+            .next(),
+            "<quantized>"
+        );
     }
 }
